@@ -127,25 +127,26 @@ class Rain(Layer):
     plinks     0..0.3  faint pitched water drops; above ~0.15 it starts to sound bubbly
     """
 
-    def __init__(self, rng, intensity=0.5, closeness=0.4, gusts=0.3, gust_period=75.0, plinks=0.06):
+    def __init__(self, rng, intensity=0.5, closeness=0.4, gusts=0.3, gust_period=75.0, plinks=0.06,
+                 wash_hz=None, tap_hz=None, tone_hz=6000.0, wash_mix=None, patter_rate=None):
         self.rng = rng
         self.wash = Noise("pink", child(rng))
-        self.wash_f = [highpass(120), lowpass(900 + 1400 * intensity, order=2)]
-        self.patter = DropBank(child(rng), [_thud(rng, rng.uniform(1500, 4500)) for _ in range(16)])
-        self.patter_rate = 500 + 3500 * intensity
+        self.wash_f = [highpass(120), lowpass(wash_hz or (900 + 1400 * intensity), order=2)]
+        self.patter = DropBank(child(rng), [_thud(rng, rng.uniform(*(tap_hz or (1500, 4500)))) for _ in range(16)])
+        self.patter_rate = patter_rate or (500 + 3500 * intensity)
         self.plinks = DropBank(child(rng), [_bubble(rng, 2500, 5000, 0.8) for _ in range(24)])
         self.plink_rate = 15 + 80 * intensity
         # Big close drops are dull taps, not bubbles.
         self.big = DropBank(child(rng), [_thud(rng, rng.uniform(400, 1100)) for _ in range(12)])
         self.big_rate = 3 + 40 * intensity * closeness
-        self.tone = lowpass(6000, order=2)
+        self.tone = lowpass(tone_hz, order=2)
         self.gusts = gusts
         self.gust_periods = [gust_period, gust_period * 0.43, gust_period * 2.7]
         self.gust_phases = rng.uniform(0, 2 * np.pi, 3)
         self.pos = 0
 
         # Mix (relative loudness of each part, after each is set to unit level).
-        self.wash_mix = 0.45 + 0.35 * intensity
+        self.wash_mix = wash_mix if wash_mix is not None else 0.45 + 0.35 * intensity
         self.patter_mix = 0.75
         self.plink_mix = float(plinks)
         self.big_mix = 0.25 + 0.3 * closeness

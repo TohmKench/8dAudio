@@ -67,7 +67,19 @@ def main(argv=None) -> int:
     pv.add_argument("--seed", type=int, default=1)
     pv.add_argument("--library")
 
+    mt = sub.add_parser("match", help="tune a base sound to match a reference recording")
+    mt.add_argument("reference")
+    mt.add_argument("--base", default="rain", choices=["rain", "ocean"])
+    mt.add_argument("-o", "--out", default="matched")
+    mt.add_argument("--evals", type=int, default=70)
+
     args = p.parse_args(argv)
+
+    if args.cmd == "match":
+        from .match import run
+        report = run(args.reference, args.base, args.out, args.evals)
+        print(json.dumps({k: report[k] for k in ("similarity_settings_only", "similarity_with_eq")}, indent=2))
+        return 0
 
     def make(a):
         sec = [] if a.no_secondary else a.secondary

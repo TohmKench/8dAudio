@@ -171,3 +171,17 @@ def test_leveler_eases_loud_parts_down_only():
     np.testing.assert_allclose(out_q, quiet)             # never turns quiet audio up or down
     out_l = lev(loud)
     assert np.std(out_l[-SR:]) < 0.6 * np.std(loud)       # loud stretch is eased down
+
+
+def test_match_measures_and_eq():
+    from sleepgen.dsp import MatchEQ
+    from sleepgen.match import compare, match_eq, measure
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((SR * 12, 2))
+    m = measure(x)
+    assert compare(m, m)["overall"] == 100.0
+    flat = MatchEQ([[100, 0], [1000, 0], [10000, 0]])
+    y = np.concatenate([flat(x[i:i + SR]) for i in range(0, len(x), SR)])
+    d = flat.delay
+    np.testing.assert_allclose(y[d:], x[:-d], atol=2e-3)
+    assert all(abs(g) < 1e-9 for _, g in match_eq(m, m))

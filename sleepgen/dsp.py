@@ -232,3 +232,27 @@ class Leveler:
         g = np.interp(np.arange(n) / self.block, np.arange(blocks + 1), points)
         self.last_gain = gains[-1]
         return x * g[:, None]
+
+
+class MatchEQ:
+    """Streaming linear-phase EQ from a list of (frequency Hz, gain dB) points."""
+
+    def __init__(self, points, taps: int = 4095, channels: int = 2):
+        pts = sorted((float(f), float(g)) for f, g in points)
+        freqs = [0.0] + [f for f, _ in pts] + [SR / 2]
+        gains = [pts[0][1]] + [g for _, g in pts] + [pts[-1][1]]
+        self.h = signal.firwin2(taps, freqs, 10 ** (np.array(gains) / 20), fs=SR)
+        self.delay = taps // 2
+        self.tail = np.zeros((taps - 1, channels))
+        self.primed = False
+        self._spec = {}
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        n = len(x)
+        size = sp_fft.next_fast_len(n + len(self.h) - 1)
+        if size not in self._spec:
+            self._spec = {size: sp_fft.rfft(self.h, size)[:, None]}
+        y = sp_fft.irfft(sp_fft.rfft(x, size, axis=0) * self._spec[size], size, axis=0)[: n + len(self.tail)]
+        y[: len(self.tail)] += self.tail
+        self.tail = y[n:].copy()
+        return y[:n]

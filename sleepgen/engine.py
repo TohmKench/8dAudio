@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import layers as L
-from .dsp import SR, Leveler, Reverb, equal_power_pan, loudness_lufs, lowpass, smooth_lfo, soft_limit
+from .dsp import SR, Leveler, MatchEQ, Reverb, equal_power_pan, loudness_lufs, lowpass, smooth_lfo, soft_limit
 
 DEFAULT_TARGET_LUFS = -26.0  # quiet and steady for sleep; YouTube never turns quiet audio up
 
@@ -130,6 +130,7 @@ class Mix:
             if rv else None
         self.wet = float(rv.get("level", 1.0)) if rv else 0.0
         self.leveler = Leveler(self.target) if m.get("leveler", True) else None
+        self.eq = MatchEQ(m["eq"]) if m.get("eq") else None
         self.gain = 1.0
 
     def raw(self, n: int) -> np.ndarray:
@@ -142,6 +143,8 @@ class Mix:
                 send += x * v.send
         if self.reverb is not None:
             dry += self.reverb(send) * self.wet
+        if self.eq is not None:
+            dry = self.eq(dry)
         return self.lp(dry) if self.lp else dry
 
     def master(self, n: int) -> np.ndarray:
