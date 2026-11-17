@@ -1,0 +1,182 @@
+"""Turns a recipe into a long audio file, streamed through ffmpeg in chunks.
+
+Memory use stays flat whatever the length: a 12 hour render holds only one
+chunk (10 s) in memory at a time.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+
+import numpy as np
+
+from . import layers as L
+from .dsp import SR, equal_power_pan, loudness_lufs, lowpass, smooth_lfo, soft_limit
+
+DEFAULT_TARGET_LUFS = -23.0  # broadcast standard: calm, steady, and YouTube never turns it up
+
+
+@dataclass
+class Voice:
+    """A layer plus its level, slow drift and movement."""
+
+    layer: L.Layer
+    level_db: float = 0.0
+    pan: dict | None = None
+    drift: dict | None = None
+    rng: np.random.Generator = field(default_factory=np.random.default_rng)
+    pos: int = 0
+
+    def __post_init__(self):
+        self.gain = 10 ** (self.level_db / 20)
+        d = self.drift or {}
+        self.drift_db = float(d.get("depth_db", 0.0))
+        base = float(d.get("period_s", 120.0))
+        self.drift_periods = [base, base * 0.37, base * 2.3]
+        self.drift_phases = self.rng.uniform(0, 2 * np.pi, 3)
+        p = self.pan or {}
+        self.pan_mode = p.get("mode", "none") if self.layer.pannable else "none"
+        self.pan_period = float(p.get("period_s", 60.0))
+        self.pan_width = float(p.get("width", 0.5))
+        self.pan_phase = self.rng.uniform(0, 2 * np.pi)
+        if self.pan_mode == "circle":
+            self.behind_lp = lowpass(2200)
+
+    def __call__(self, n: int) -> np.ndarray:
+        x = self.layer(n) * self.gain
+        t = (self.pos + np.arange(n)) / SR
+        self.pos += n
+        if self.drift_db:
+            db = self.drift_db * smooth_lfo(t, self.drift_periods, self.drift_phases, [1.0, 0.5, 0.7])
+            x = x * (10 ** (db / 20))[:, None]
+        if self.pan_mode in ("sweep", "circle"):
+            angle = 2 * np.pi * t / self.pan_period + self.pan_phase
+            gl, gr = equal_power_pan(self.pan_width * np.sin(angle))
+            if self.pan_mode == "circle":
+                # Sound passing behind the head: a little duller and quieter.
+                behind = np.clip(-np.cos(angle), 0, 1)[:, None] * 0.6
+                x = (1 - behind) * x + behind * self.behind_lp(x)
+                x = x * (1 - 0.2 * behind)
+            x = x * np.stack([gl, gr], axis=1)
+        return x
+
+
+def build_voices(recipe: dict) -> list[Voice]:
+    seq = np.random.SeedSequence(int(recipe.get("seed", 0)))
+    children = seq.spawn(len(recipe["layers"]) * 2)
+    voices = []
+    for i, spec in enumerate(recipe["layers"]):
+        kind = spec["type"]
+        if kind not in L.LAYER_TYPES:
+            raise ValueError(f"unknown layer type {kind!r}")
+        layer = L.LAYER_TYPES[kind](np.random.default_rng(children[2 * i]), **spec.get("params", {}))
+        voices.append(Voice(layer, spec.get("level_db", 0.0), spec.get("pan"), spec.get("drift"),
+                            np.random.default_rng(children[2 * i + 1])))
+    return voices
+
+
+class Mix:
+    """Sums the voices and applies the master chain."""
+
+    def __init__(self, recipe: dict):
+        self.voices = build_voices(recipe)
+        m = recipe.get("master", {})
+        self.lp = lowpass(m["lowpass_hz"], order=2) if m.get("lowpass_hz") else None
+        self.target = float(m.get("target_lufs", DEFAULT_TARGET_LUFS))
+        self.fade_in = float(m.get("fade_in_s", 20.0))
+        self.fade_out = float(m.get("fade_out_s", 45.0))
+        self.gain = 1.0
+
+    def raw(self, n: int) -> np.ndarray:
+        x = sum(v(n) for v in self.voices)
+        return self.lp(x) if self.lp else x
+
+    def calibrate(self, seconds: float = 120.0) -> float:
+        """Measure a stretch of the mix and set the gain that hits the target loudness."""
+        block = np.concatenate([self.raw(SR * 10) for _ in range(int(seconds // 10))])
+        measured = loudness_lufs(block)
+        self.gain = 10 ** ((self.target - measured) / 20)
+        return measured
+
+
+def _ffmpeg_cmd(out_path: str, bitrate: str) -> list[str]:
+    ext = os.path.splitext(out_path)[1].lower()
+    codec = {
+        ".m4a": ["-c:a", "aac", "-b:a", bitrate],
+        ".aac": ["-c:a", "aac", "-b:a", bitrate],
+        ".mp3": ["-c:a", "libmp3lame", "-b:a", bitrate],
+        ".opus": ["-c:a", "libopus", "-b:a", bitrate],
+        ".flac": ["-c:a", "flac"],
+        ".wav": ["-c:a", "pcm_s16le"],
+    }.get(ext)
+    if codec is None:
+        raise ValueError(f"unsupported output type {ext!r} (use .m4a, .mp3, .opus, .flac or .wav)")
+    return ["ffmpeg", "-y", "-v", "error", "-f", "f32le", "-ar", str(SR), "-ac", "2", "-i", "pipe:0",
+            *codec, out_path]
+
+
+def render(recipe: dict, out_path: str, seconds: float, chunk_s: float = 10.0,
+           bitrate: str = "256k", progress: bool = True) -> dict:
+    """Render `seconds` of audio for `recipe` to `out_path`. Returns a render report."""
+    started = time.time()
+    # Measure loudness on a throwaway copy so the real render starts from t=0
+    # (otherwise the first thunder roll etc. would be spent on the measurement).
+    measured = Mix(recipe).calibrate()
+    mix = Mix(recipe)
+    mix.gain = 10 ** ((mix.target - measured) / 20)
+    total = int(seconds * SR)
+    chunk = int(chunk_s * SR)
+    fi, fo = int(mix.fade_in * SR), int(mix.fade_out * SR)
+    peak = 0.0
+    proc = subprocess.Popen(_ffmpeg_cmd(out_path, bitrate), stdin=subprocess.PIPE)
+    try:
+        done = 0
+        last_report = 0.0
+        while done < total:
+            n = min(chunk, total - done)
+            x = mix.raw(n) * mix.gain
+            idx = done + np.arange(n)
+            fade = np.ones(n)
+            if done < fi:
+                fade = np.minimum(fade, (1 - np.cos(np.pi * np.clip(idx / fi, 0, 1))) / 2)
+            if done + n > total - fo:
+                fade = np.minimum(fade, (1 - np.cos(np.pi * np.clip((total - idx) / fo, 0, 1))) / 2)
+            x = soft_limit(x * fade[:, None])
+            peak = max(peak, float(np.max(np.abs(x))))
+            proc.stdin.write(x.astype(np.float32).tobytes())
+            done += n
+            if progress and (time.time() - last_report > 5 or done == total):
+                last_report = time.time()
+                pct = 100 * done / total
+                rate = done / SR / max(time.time() - started, 1e-6)
+                print(f"\r  {pct:5.1f}%  {done / SR / 3600:5.2f} h rendered  ({rate:.0f}x realtime)",
+                      end="", file=sys.stderr, flush=True)
+        if progress:
+            print(file=sys.stderr)
+    finally:
+        proc.stdin.close()
+        code = proc.wait()
+    if code != 0:
+        raise RuntimeError(f"ffmpeg exited with code {code}")
+    return {
+        "output": out_path,
+        "seconds": seconds,
+        "measured_lufs_before_gain": round(float(measured), 2),
+        "target_lufs": mix.target,
+        "peak_dbfs": round(float(20 * np.log10(peak + 1e-12)), 2),
+        "render_seconds": round(time.time() - started, 1),
+    }
+
+
+def render_with_sidecar(recipe: dict, out_path: str, seconds: float, **kw) -> dict:
+    """Render and write `<out>.json` holding the recipe and report (used later for titles/analytics)."""
+    report = render(recipe, out_path, seconds, **kw)
+    sidecar = os.path.splitext(out_path)[0] + ".json"
+    with open(sidecar, "w") as f:
+        json.dump({"recipe": recipe, "render": report}, f, indent=2)
+    return report
