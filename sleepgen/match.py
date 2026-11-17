@@ -160,7 +160,7 @@ def match_eq(ref: dict, ours: dict, limit_db: float = 9.0):
 
 
 def run(reference: str, base: str = "rain", out_dir: str = "matched", evals: int = 70,
-        seconds: float = 12.0, seed: int = 0, log=print) -> dict:
+        seconds: float = 12.0, seed: int = 0, rounds: int = 3, refine: int = 15, log=print) -> dict:
     if base not in SPACES:
         raise ValueError(f"matching supports: {', '.join(SPACES)}")
     os.makedirs(out_dir, exist_ok=True)
@@ -170,8 +170,8 @@ def run(reference: str, base: str = "rain", out_dir: str = "matched", evals: int
     space = SPACES[base]
     rng = np.random.default_rng(seed)
 
-    def score(v):
-        ours = measure(_synth(_recipe(base, _params(base, v)), seconds))
+    def score(v, eq=None):
+        ours = measure(_synth(_recipe(base, _params(base, v), eq), seconds))
         return compare(ref, ours)["overall"], ours
 
     best_v, best_s, best_m = None, -1.0, None
@@ -185,12 +185,27 @@ def run(reference: str, base: str = "rain", out_dir: str = "matched", evals: int
         if s > best_s:
             best_v, best_s, best_m = v, s, m
             log(f"  [{i + 1}/{evals}] new best {s:.1f}")
-    params = _params(base, best_v)
     before = compare(ref, best_m)
-    eq = match_eq(ref, best_m)
-    after_m = measure(_synth(_recipe(base, params, eq), seconds * 2))
+
+    # Refine: add a matching EQ, re-tune the settings with it in place, repeat.
+    eq = None
+    for rnd in range(rounds):
+        step = match_eq(ref, best_m)
+        if eq is None:
+            eq = step
+        else:
+            eq = [[f, round(float(np.clip(g + 0.7 * d, -12, 12)), 2)] for (f, g), (_, d) in zip(eq, step)]
+        best_s, best_m = score(best_v, eq)
+        for i in range(refine):
+            v = _nudge(space, best_v, rng, 0.08 * (1 - i / refine) + 0.02)
+            s, m = score(v, eq)
+            if s > best_s:
+                best_v, best_s, best_m = v, s, m
+        log(f"  refine round {rnd + 1}: {best_s:.1f}")
+    params = _params(base, best_v)
+    after_m = measure(_synth(_recipe(base, params, eq), seconds * 3))
     after = compare(ref, after_m)
-    log(f"settings only: {before['overall']}  with matching EQ: {after['overall']}")
+    log(f"settings only: {before['overall']}  after refining with matching EQ: {after['overall']}")
 
     recipe = _recipe(base, params, eq)
     recipe["master"].pop("leveler", None)
