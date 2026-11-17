@@ -7,7 +7,7 @@ import pytest
 
 from sleepgen import engine, layers
 from sleepgen.dsp import SR, loudness_lufs
-from sleepgen.recipes import THEMES, random_recipe
+from sleepgen.recipes import BASES, available_bases, random_recipe
 
 
 def _render_raw(recipe, seconds, chunk_s):
@@ -36,7 +36,7 @@ def test_chunk_size_does_not_change_output(spec):
     np.testing.assert_allclose(a, b, atol=1e-9)
 
 
-@pytest.mark.parametrize("theme", sorted(THEMES))
+@pytest.mark.parametrize("theme", available_bases())
 def test_every_theme_renders_to_target(theme, tmp_path):
     recipe = random_recipe(11, theme)
     json.dumps(recipe)  # recipes must be plain JSON
@@ -85,7 +85,7 @@ def test_sample_layer_loops_without_gaps(tmp_path):
     level = np.sqrt(np.mean(x[: len(x) // win * win].reshape(-1, win, 2) ** 2, axis=(1, 2)))
     assert level.min() > 0.4 * np.median(level)  # no dropouts at the joins
 
-    picked = [random_recipe(seed, "gentle_rain", library=str(tmp_path)) for seed in range(10)]
+    picked = [random_recipe(seed, "rain", library=str(tmp_path)) for seed in range(10)]
     assert any(l["type"] == "sample" for r in picked for l in r["layers"])
 
 
@@ -95,3 +95,57 @@ def test_sidecar_written(tmp_path):
     side = json.loads((tmp_path / "v.json").read_text())
     assert side["recipe"]["meta"]["theme"] == "fan"
     assert os.path.getsize(out) > 10_000
+
+
+def _lib(tmp_path, *cats):
+    for c in cats:
+        d = tmp_path / c
+        d.mkdir()
+        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "anoisesrc=d=6:c=brown:a=0.2",
+                        "-ac", "2", str(d / "a.wav")], check=True)
+    return str(tmp_path)
+
+
+def test_library_only_parts_need_the_library(tmp_path):
+    assert "stream" not in available_bases()
+    with pytest.raises(ValueError):
+        random_recipe(1, "stream")
+    lib = _lib(tmp_path, "stream", "owl")
+    assert "stream" in available_bases(lib)
+    r = random_recipe(1, "stream", library=lib, accents=["owl"])
+    assert r["meta"]["headline"].endswith("Owl")
+    assert r["meta"]["sources"]
+
+
+def test_tiers_and_headline():
+    r = random_recipe(4, "rain", secondaries=["noise_bed", "wind"], accents=["crickets"])
+    m = r["meta"]
+    assert m["secondaries"] == ["noise_bed", "wind"] and m["accents"] == ["crickets"]
+    assert m["headline"].endswith("with Distant Wind and Crickets")
+    assert m["combo"] == "rain+noise_bed+wind+crickets"
+    levels = [l["level_db"] for l in r["layers"]]
+    assert levels[0] == 0 and all(-16 <= v <= -6 for v in levels[1:])
+
+
+def test_bases_only_offer_known_parts():
+    from sleepgen.recipes import ACCENTS, SECONDARIES
+    for spec in BASES.values():
+        assert set(spec["secondaries"]) <= set(SECONDARIES)
+        assert set(spec["accents"]) <= set(ACCENTS)
+
+
+def test_accents_come_and_go_then_stop():
+    spec = {"type": "crickets", "params": {}, "gate": {"on_s": [5, 5], "off_s": [10, 10], "start_s": 2,
+                                                       "until_s": 60, "until_fade_s": 10}}
+    x = _render_raw({"seed": 1, "layers": [spec]}, 80, 1)
+    level = np.sqrt(np.mean(x.reshape(80, SR, 2) ** 2, axis=(1, 2)))
+    assert level[:2].max() == 0                 # silent until start_s
+    assert level[2:7].min() > 0                 # first burst
+    assert level[8:16].max() == 0               # gap
+    assert level[60:].max() == 0                # stopped for the rest of the night
+
+
+def test_wind_and_crickets_are_unit_level():
+    for kind in (layers.Wind, layers.Crickets):
+        x = kind(np.random.default_rng(2))(SR * 20)
+        assert 0.5 < np.sqrt(np.mean(x ** 2)) < 2

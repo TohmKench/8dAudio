@@ -11,7 +11,9 @@ import subprocess
 
 import numpy as np
 
-from .dsp import SR, Noise, bandpass, highpass, lowpass, rms
+from scipy import signal
+
+from .dsp import SOS, SR, Noise, bandpass, highpass, lowpass, rms
 
 
 def child(rng: np.random.Generator) -> np.random.Generator:
@@ -274,6 +276,76 @@ class Drone(Layer):
         return out * self.gain
 
 
+class Wind(Layer):
+    """Soft wind: broadband air whose tone rises and falls with slow gusts.
+
+    strength  0..1  how far the gusts swing
+    whistle   0..1  a faint resonant whistle on the strongest gusts
+    """
+
+    def __init__(self, rng, strength=0.5, whistle=0.2, gust_period=22.0):
+        self.src = Noise("pink", child(rng))
+        self.bands = [lowpass(420), bandpass(300, 900), bandpass(700, 1900)]
+        self.whistle_bp = SOS(signal.butter(1, [rng.uniform(550, 950), rng.uniform(1000, 1250)],
+                                            "bandpass", fs=SR, output="sos"))
+        self.tone = lowpass(3200)
+        self.strength, self.whistle = strength, whistle
+        self.periods = np.array([gust_period, gust_period * 0.43, gust_period * 2.3])
+        self.phases = rng.uniform(0, 2 * np.pi, 3)
+        self.pos = 0
+        self.gain = 1.0
+        self.gain = self._unit(self, seconds=60)
+
+    def __call__(self, n):
+        t = (self.pos + np.arange(n)) / SR
+        self.pos += n
+        lfo = np.sin(2 * np.pi * t[:, None] / self.periods[None, :] + self.phases[None, :]) @ [0.5, 0.2, 0.3]
+        g = ((lfo + 1) / 2) ** 1.5  # 0 = lull, 1 = gust
+        x = self.src(n)
+        low, mid, high = (b(x) for b in self.bands)
+        s = self.strength
+        out = (low * (1 - 0.5 * s * g)[:, None]
+               + mid * (0.3 + 0.9 * s * g)[:, None]
+               + high * (0.08 + 0.6 * s * g ** 2)[:, None]
+               + self.whistle_bp(x) * (self.whistle * 3 * g ** 3)[:, None])
+        level = (1 - 0.6 * s) + 0.6 * s * g
+        return self.tone(out * level[:, None]) * self.gain
+
+
+class Crickets(Layer):
+    """A few distant crickets, each with its own pitch, rhythm and position."""
+
+    def __init__(self, rng, count=3, distance=0.5):
+        self.crickets = []
+        for _ in range(int(count)):
+            self.crickets.append(dict(
+                freq=rng.uniform(3800, 5200), pulse_rate=rng.uniform(24, 42),
+                pulses=int(rng.integers(2, 6)), period=rng.uniform(0.45, 1.3),
+                offset=rng.uniform(0, 2), pan=rng.uniform(-0.8, 0.8), amp=rng.uniform(0.5, 1.0),
+                rest_period=rng.uniform(15, 50), rest_phase=rng.uniform(0, 2 * np.pi),
+                ph=rng.uniform(0, 2 * np.pi)))
+        self.distance = lowpass(6500 - 3000 * distance, order=2)
+        self.pos = 0
+        self.gain = 1.0
+        self.gain = self._unit(self, seconds=30)
+
+    def __call__(self, n):
+        t = (self.pos + np.arange(n)) / SR
+        self.pos += n
+        out = np.zeros((n, 2))
+        for c in self.crickets:
+            phase = (t + c["offset"]) % c["period"]
+            k = phase * c["pulse_rate"]
+            active = k < c["pulses"]
+            env = np.where(active, np.sin(np.pi * (k % 1.0)) ** 2, 0.0)
+            # Each cricket pauses now and then, like real ones do.
+            env *= np.clip(1.5 * np.sin(2 * np.pi * t / c["rest_period"] + c["rest_phase"]) + 0.8, 0, 1)
+            tone = c["amp"] * env * np.sin(2 * np.pi * c["freq"] * t + c["ph"])
+            out[:, 0] += tone * np.sqrt((1 - c["pan"]) / 2)
+            out[:, 1] += tone * np.sqrt((1 + c["pan"]) / 2)
+        return self.distance(out) * self.gain
+
+
 def decode_audio(path: str, max_seconds: float = 900) -> np.ndarray:
     """Decode any audio file to 48 kHz stereo float with ffmpeg."""
     cmd = ["ffmpeg", "-v", "error", "-i", path, "-t", str(max_seconds),
@@ -334,5 +406,7 @@ LAYER_TYPES = {
     "fan": Fan,
     "binaural": Binaural,
     "drone": Drone,
+    "wind": Wind,
+    "crickets": Crickets,
     "sample": Sample,
 }

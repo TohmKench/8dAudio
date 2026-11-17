@@ -29,6 +29,7 @@ class Voice:
     level_db: float = 0.0
     pan: dict | None = None
     drift: dict | None = None
+    gate: dict | None = None
     rng: np.random.Generator = field(default_factory=np.random.default_rng)
     pos: int = 0
 
@@ -46,11 +47,41 @@ class Voice:
         self.pan_phase = self.rng.uniform(0, 2 * np.pi)
         if self.pan_mode == "circle":
             self.behind_lp = lowpass(2200)
+        self.gate_env = np.zeros(0)
+        g = self.gate or {}
+        self.until = int(SR * g["until_s"]) if g.get("until_s") else None
+        self.until_fade = int(SR * g.get("until_fade_s", 300))
+        if g.get("on_s"):
+            self.gate_env = np.zeros(int(SR * g.get("start_s", 0)))
+
+    def _gate(self, n: int) -> np.ndarray:
+        """Accent timing: on for a while, off for a while, with soft edges."""
+        g = self.gate
+        while len(self.gate_env) < n:
+            on = int(SR * self.rng.uniform(*g["on_s"]))
+            off = int(SR * self.rng.uniform(*g["off_s"]))
+            fade = min(int(SR * g.get("fade_s", 3.0)), on // 2)
+            seg = np.ones(on)
+            ramp = (1 - np.cos(np.linspace(0, np.pi, fade))) / 2
+            seg[:fade] = ramp
+            seg[on - fade:] = ramp[::-1]
+            self.gate_env = np.concatenate([self.gate_env, seg, np.zeros(off)])
+        e, self.gate_env = self.gate_env[:n], self.gate_env[n:]
+        return e
 
     def __call__(self, n: int) -> np.ndarray:
+        start = self.pos
+        if self.until is not None and start >= self.until:
+            self.pos += n
+            return np.zeros((n, 2))  # finished: costs nothing for the rest of the night
         x = self.layer(n) * self.gain
         t = (self.pos + np.arange(n)) / SR
         self.pos += n
+        if self.gate and self.gate.get("on_s"):
+            x = x * self._gate(n)[:, None]
+        if self.until is not None:
+            left = (self.until - (start + np.arange(n))) / max(self.until_fade, 1)
+            x = x * ((1 - np.cos(np.pi * np.clip(left, 0, 1))) / 2)[:, None]
         if self.drift_db:
             db = self.drift_db * smooth_lfo(t, self.drift_periods, self.drift_phases, [1.0, 0.5, 0.7])
             x = x * (10 ** (db / 20))[:, None]
@@ -76,7 +107,7 @@ def build_voices(recipe: dict) -> list[Voice]:
             raise ValueError(f"unknown layer type {kind!r}")
         layer = L.LAYER_TYPES[kind](np.random.default_rng(children[2 * i]), **spec.get("params", {}))
         voices.append(Voice(layer, spec.get("level_db", 0.0), spec.get("pan"), spec.get("drift"),
-                            np.random.default_rng(children[2 * i + 1])))
+                            spec.get("gate"), np.random.default_rng(children[2 * i + 1])))
     return voices
 
 
