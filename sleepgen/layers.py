@@ -95,13 +95,13 @@ class DropBank:
         return out[:n]
 
 
-def _bubble(rng, f_lo, f_hi, softness=1.0):
+def _bubble(rng, f_lo, f_hi, softness=1.0, rise=(0.005, 0.02)):
     """One water-drop 'plink': a decaying sine whose pitch rises (a Minnaert bubble)."""
     f0 = rng.uniform(f_lo, f_hi)
     tau = softness * 1.6 / (0.13 * f0 + 0.0072 * f0 ** 1.5)
     n = int(SR * tau * 6)
     t = np.arange(n) / SR
-    sigma = rng.uniform(0.02, 0.07) * f0
+    sigma = rng.uniform(*rise) * f0  # a big rise sounds "bloopy", so keep it small
     phase = 2 * np.pi * f0 * (t + sigma * t ** 2 / 2)
     env = np.exp(-t / tau) * (1 - np.exp(-t / 0.0004))
     k = env * np.sin(phase)
@@ -124,20 +124,21 @@ class Rain(Layer):
     intensity  0..1  light drizzle to downpour
     closeness  0..1  how many big, close, lower drops there are
     gusts      0..1  depth of slow intensity swells
+    plinks     0..0.3  faint pitched water drops; above ~0.15 it starts to sound bubbly
     """
 
-    def __init__(self, rng, intensity=0.5, closeness=0.4, gusts=0.3, gust_period=75.0):
+    def __init__(self, rng, intensity=0.5, closeness=0.4, gusts=0.3, gust_period=75.0, plinks=0.06):
         self.rng = rng
         self.wash = Noise("pink", child(rng))
         self.wash_f = [highpass(120), lowpass(900 + 1400 * intensity, order=2)]
-        self.patter = DropBank(child(rng), [_thud(rng, rng.uniform(1500, 3000)) for _ in range(16)])
+        self.patter = DropBank(child(rng), [_thud(rng, rng.uniform(1500, 4500)) for _ in range(16)])
         self.patter_rate = 500 + 3500 * intensity
-        self.plinks = DropBank(child(rng), [_bubble(rng, 1400, 3800) for _ in range(24)])
-        self.plink_rate = 30 + 250 * intensity
-        self.big = DropBank(child(rng), [_bubble(rng, 450, 1300, 1.4) for _ in range(10)]
-                            + [_thud(rng, rng.uniform(500, 900)) for _ in range(5)])
+        self.plinks = DropBank(child(rng), [_bubble(rng, 2500, 5000, 0.8) for _ in range(24)])
+        self.plink_rate = 15 + 80 * intensity
+        # Big close drops are dull taps, not bubbles.
+        self.big = DropBank(child(rng), [_thud(rng, rng.uniform(400, 1100)) for _ in range(12)])
         self.big_rate = 3 + 40 * intensity * closeness
-        self.tone = lowpass(5200, order=2)
+        self.tone = lowpass(6000, order=2)
         self.gusts = gusts
         self.gust_periods = [gust_period, gust_period * 0.43, gust_period * 2.7]
         self.gust_phases = rng.uniform(0, 2 * np.pi, 3)
@@ -145,8 +146,8 @@ class Rain(Layer):
 
         # Mix (relative loudness of each part, after each is set to unit level).
         self.wash_mix = 0.45 + 0.35 * intensity
-        self.patter_mix = 0.55
-        self.plink_mix = 0.45
+        self.patter_mix = 0.75
+        self.plink_mix = float(plinks)
         self.big_mix = 0.25 + 0.3 * closeness
 
         self.wash_g = self._unit(self._wash)
