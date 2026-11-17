@@ -124,7 +124,8 @@ def test_tiers_and_headline():
     assert m["headline"].endswith("with Distant Wind and Crickets")
     assert m["combo"] == "rain+noise_bed+wind+crickets"
     levels = [l["level_db"] for l in r["layers"]]
-    assert levels[0] == 0 and all(-16 <= v <= -6 for v in levels[1:])
+    assert levels[0] == 0 and all(-22 <= v <= -6 for v in levels[1:])
+    assert r["layers"][-1]["send"] > 0.5 and r["layers"][-1]["dry"] < 0.6  # accents sit far away
 
 
 def test_bases_only_offer_known_parts():
@@ -149,3 +150,24 @@ def test_wind_and_crickets_are_unit_level():
     for kind in (layers.Wind, layers.Crickets):
         x = kind(np.random.default_rng(2))(SR * 20)
         assert 0.5 < np.sqrt(np.mean(x ** 2)) < 2
+
+
+def test_reverb_has_no_seams_between_chunks():
+    recipe = {"seed": 3, "master": {"reverb": {"rt60": 2.0}},
+              "layers": [{"type": "noise", "params": {"color": "pink"}, "send": 0.5},
+                         {"type": "crickets", "params": {}, "send": 0.8, "dry": 0.4}]}
+    a = _render_raw(recipe, 8, 1.0)
+    b = _render_raw(recipe, 8, 3.7)
+    np.testing.assert_allclose(a, b, atol=1e-8)
+
+
+def test_leveler_eases_loud_parts_down_only():
+    from sleepgen.dsp import Leveler
+    rng = np.random.default_rng(0)
+    quiet = rng.standard_normal((SR * 10, 2)) * 0.01
+    loud = rng.standard_normal((SR * 10, 2)) * 0.2
+    lev = Leveler(-26)
+    out_q = lev(quiet)
+    np.testing.assert_allclose(out_q, quiet)             # never turns quiet audio up or down
+    out_l = lev(loud)
+    assert np.std(out_l[-SR:]) < 0.6 * np.std(loud)       # loud stretch is eased down

@@ -49,7 +49,7 @@ def main(argv=None) -> int:
         g = sp.add_mutually_exclusive_group()
         g.add_argument("--hours", type=float, default=10.0)
         g.add_argument("--seconds", type=float)
-        sp.add_argument("--bitrate", default="256k")
+        sp.add_argument("--bitrate", default="384k")
 
     rn = sub.add_parser("render", help="render a recipe JSON")
     rn.add_argument("recipe")

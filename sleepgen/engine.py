@@ -16,9 +16,9 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import layers as L
-from .dsp import SR, equal_power_pan, loudness_lufs, lowpass, smooth_lfo, soft_limit
+from .dsp import SR, Leveler, Reverb, equal_power_pan, loudness_lufs, lowpass, smooth_lfo, soft_limit
 
-DEFAULT_TARGET_LUFS = -23.0  # broadcast standard: calm, steady, and YouTube never turns it up
+DEFAULT_TARGET_LUFS = -26.0  # quiet and steady for sleep; YouTube never turns quiet audio up
 
 
 @dataclass
@@ -30,6 +30,8 @@ class Voice:
     pan: dict | None = None
     drift: dict | None = None
     gate: dict | None = None
+    send: float = 0.0  # how much goes into the shared reverb (0..1)
+    dry: float = 1.0  # direct sound; lower = further away
     rng: np.random.Generator = field(default_factory=np.random.default_rng)
     pos: int = 0
 
@@ -107,7 +109,8 @@ def build_voices(recipe: dict) -> list[Voice]:
             raise ValueError(f"unknown layer type {kind!r}")
         layer = L.LAYER_TYPES[kind](np.random.default_rng(children[2 * i]), **spec.get("params", {}))
         voices.append(Voice(layer, spec.get("level_db", 0.0), spec.get("pan"), spec.get("drift"),
-                            spec.get("gate"), np.random.default_rng(children[2 * i + 1])))
+                            spec.get("gate"), float(spec.get("send", 0.0)), float(spec.get("dry", 1.0)),
+                            np.random.default_rng(children[2 * i + 1])))
     return voices
 
 
@@ -121,11 +124,30 @@ class Mix:
         self.target = float(m.get("target_lufs", DEFAULT_TARGET_LUFS))
         self.fade_in = float(m.get("fade_in_s", 20.0))
         self.fade_out = float(m.get("fade_out_s", 45.0))
+        rv = m.get("reverb")
+        rv_rng = np.random.default_rng(int(recipe.get("seed", 0)) + 7919)
+        self.reverb = Reverb(rv_rng, **{k: rv[k] for k in ("rt60", "predelay_ms", "damping") if k in rv}) \
+            if rv else None
+        self.wet = float(rv.get("level", 1.0)) if rv else 0.0
+        self.leveler = Leveler(self.target) if m.get("leveler", True) else None
         self.gain = 1.0
 
     def raw(self, n: int) -> np.ndarray:
-        x = sum(v(n) for v in self.voices)
-        return self.lp(x) if self.lp else x
+        dry = np.zeros((n, 2))
+        send = np.zeros((n, 2))
+        for v in self.voices:
+            x = v(n)
+            dry += x * v.dry
+            if v.send:
+                send += x * v.send
+        if self.reverb is not None:
+            dry += self.reverb(send) * self.wet
+        return self.lp(dry) if self.lp else dry
+
+    def master(self, n: int) -> np.ndarray:
+        """Final-level audio: raw mix x calibrated gain, eased by the leveler."""
+        x = self.raw(n) * self.gain
+        return self.leveler(x) if self.leveler else x
 
     def calibrate(self, seconds: float = 120.0) -> float:
         """Measure a stretch of the mix and set the gain that hits the target loudness."""
@@ -152,7 +174,7 @@ def _ffmpeg_cmd(out_path: str, bitrate: str) -> list[str]:
 
 
 def render(recipe: dict, out_path: str, seconds: float, chunk_s: float = 10.0,
-           bitrate: str = "256k", progress: bool = True) -> dict:
+           bitrate: str = "384k", progress: bool = True) -> dict:
     """Render `seconds` of audio for `recipe` to `out_path`. Returns a render report."""
     started = time.time()
     # Measure loudness on a throwaway copy so the real render starts from t=0
@@ -170,7 +192,7 @@ def render(recipe: dict, out_path: str, seconds: float, chunk_s: float = 10.0,
         last_report = 0.0
         while done < total:
             n = min(chunk, total - done)
-            x = mix.raw(n) * mix.gain
+            x = mix.master(n)
             idx = done + np.arange(n)
             fade = np.ones(n)
             if done < fi:

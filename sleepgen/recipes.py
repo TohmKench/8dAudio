@@ -84,7 +84,7 @@ def base_rain(rng, ctx):
 def base_ocean(rng, ctx):
     layers = [{"type": "ocean", "level_db": 0.0,
                "params": {"min_period": _r(rng, 6, 9, 1), "max_period": _r(rng, 10, 15, 1),
-                          "brightness": _r(rng, 0.2, 0.7), "calm": _r(rng, 0.2, 0.45)},
+                          "brightness": _r(rng, 0.2, 0.6), "calm": _r(rng, 0.4, 0.6)},
                "pan": _pan(rng, width=(0.15, 0.35), period=(90, 200))}]
     if library_files(ctx["library"], ["ocean"]) and rng.random() < 0.7:
         layers.append(_sample(rng, ctx, ["ocean"], _r(rng, -6, 0, 1)))
@@ -191,7 +191,7 @@ def acc_crickets(rng, ctx, level):
         layer = _sample(rng, ctx, ["crickets"], level)
     else:
         layer = {"type": "crickets", "level_db": level,
-                 "params": {"count": int(rng.integers(2, 6)), "distance": _r(rng, 0.4, 0.9)}}
+                 "params": {"count": int(rng.integers(2, 6)), "distance": _r(rng, 0.6, 0.95)}}
     layer["gate"] = _gate(rng, (20, 60), (30, 120))
     return layer, "Crickets"
 
@@ -288,6 +288,8 @@ def random_recipe(seed: int | None = None, theme: str | None = None, library: st
     ctx = {"library": library, "sources": [], "features": []}
 
     layers, base_label = spec["build"](rng, ctx)
+    for l in layers:  # the base is close and mostly direct, with a touch of the room
+        l.setdefault("send", _r(rng, 0.12, 0.25))
 
     # Secondaries
     pool = _available(SECONDARIES, spec["secondaries"], library)
@@ -297,6 +299,8 @@ def random_recipe(seed: int | None = None, theme: str | None = None, library: st
     sec_labels = []
     for name in secondaries:
         layer, label = SECONDARIES[name]["build"](rng, ctx, _r(rng, -14, -6, 1))
+        if layer["type"] != "binaural":  # tones stay dry so the beat survives
+            layer.setdefault("send", _r(rng, 0.25, 0.45))
         layers.append(layer)
         sec_labels.append(label)
 
@@ -309,7 +313,10 @@ def random_recipe(seed: int | None = None, theme: str | None = None, library: st
     acc_labels = []
     stop_at = _r(rng, 2700, 3600, 0)  # 45-60 minutes in
     for name in accents:
-        layer, label = ACCENTS[name]["build"](rng, ctx, _r(rng, -14, -8, 1))
+        # Accents are quiet and far away: mostly reverb, little direct sound.
+        layer, label = ACCENTS[name]["build"](rng, ctx, _r(rng, -20, -14, 1))
+        layer.setdefault("send", _r(rng, 0.6, 0.85))
+        layer.setdefault("dry", _r(rng, 0.3, 0.5))
         layer.setdefault("gate", {})
         layer["gate"].update({"until_s": stop_at, "until_fade_s": 300})
         layers.append(layer)
@@ -332,5 +339,7 @@ def random_recipe(seed: int | None = None, theme: str | None = None, library: st
     }
     if ctx["sources"]:
         meta["sources"] = ctx["sources"]
-    master = {"lowpass_hz": int(rng.uniform(7000, 12000)), "fade_in_s": 20, "fade_out_s": 45}
+    master = {"lowpass_hz": int(rng.uniform(7000, 12000)), "fade_in_s": 20, "fade_out_s": 45,
+              "reverb": {"rt60": _r(rng, 1.6, 3.2), "predelay_ms": _r(rng, 15, 40, 0),
+                         "damping": _r(rng, 0.4, 0.8), "level": 1.0}}
     return {"version": 2, "seed": seed, "master": master, "layers": layers, "meta": meta}

@@ -37,16 +37,22 @@ recipe's `meta` block (theme, headline, features) feeds video titles and the wee
 
 ## How it keeps things right for sleep
 
-- **Steady, quiet volume.** Every mix is measured and set to -23 LUFS (the broadcast standard), with
-  a soft limiter at -1 dBFS. YouTube only ever turns loud videos down, never quiet ones up.
+- **Steady, quiet volume.** Every mix is measured and set to -26 LUFS, a slow leveler eases down
+  anything that swells more than 3 dB above that (big waves, thunder), and a soft limiter sits at
+  -1 dBFS. YouTube only ever turns loud videos down, never quiet ones up.
+- **One shared space.** All layers feed a convolution reverb with a natural, darkening tail. The
+  base is mostly direct, secondaries sit further back, and accents are mostly reverb, so a cricket
+  sounds like it's out in the garden, not in your ear.
 - **No surprises.** Rain drops are capped so none pokes out of the bed, thunder is rare, low and
   distant, and slow level drift keeps it alive without anything sudden.
 - **No audible loop.** Everything is generated live, and library recordings are played as random
   stretches with crossfades between them.
 - **8D movement** (`pan.mode`: `sweep` or `circle`) is gentle by default (width 0.3 to 0.75) so it
   stays comfortable for someone lying on one ear. Binaural beats are never panned.
-- **Long renders use little memory.** Audio streams to ffmpeg in 10 second chunks, at about 20x real
-  time on 4 cores, so a 10 hour video takes around 30 minutes.
+- **Quality over speed.** Rain is built from thousands of individually modelled drops per second
+  (impacts plus pitched water "plinks"), with dozens of drop shapes for variety. A 10 hour layered
+  mix takes roughly 1 to 3 hours to render depending on the CPU. Audio streams to ffmpeg in
+  10 second chunks, so memory stays flat, and output is 384 kbps AAC (YouTube's recommended rate).
 
 ## Sound library (optional)
 
@@ -68,13 +74,14 @@ at least 30 seconds long and free of voices, cars, birds and other sharp sounds.
 ```json
 {
   "seed": 7,
-  "master": {"target_lufs": -23, "lowpass_hz": 9000, "fade_in_s": 20, "fade_out_s": 45},
+  "master": {"target_lufs": -26, "lowpass_hz": 9000, "fade_in_s": 20, "fade_out_s": 45,
+             "reverb": {"rt60": 2.2, "predelay_ms": 25, "damping": 0.6}},
   "layers": [
     {"type": "rain", "level_db": 0, "params": {"intensity": 0.6, "closeness": 0.4},
      "pan": {"mode": "circle", "width": 0.6, "period_s": 50},
      "drift": {"depth_db": 1.5, "period_s": 120}},
-    {"type": "wind", "level_db": -10, "params": {"strength": 0.5}},
-    {"type": "crickets", "level_db": -12, "params": {"count": 3},
+    {"type": "wind", "level_db": -10, "params": {"strength": 0.5}, "send": 0.35},
+    {"type": "crickets", "level_db": -18, "params": {"count": 3}, "send": 0.75, "dry": 0.4,
      "gate": {"on_s": [20, 60], "off_s": [30, 120], "start_s": 40, "until_s": 3000, "until_fade_s": 300}}
   ],
   "meta": {"base": "rain", "secondaries": ["wind"], "accents": ["crickets"],
@@ -83,7 +90,8 @@ at least 30 seconds long and free of voices, cars, birds and other sharp sounds.
 ```
 
 Layer types: `noise`, `rain`, `thunder`, `ocean`, `fan`, `wind`, `crickets`, `binaural`, `drone`, `sample`.
-`gate` makes any layer come and go (`on_s` / `off_s` ranges) and stop for good at `until_s`.
+`send` (0 to 1) feeds the shared reverb and `dry` (0 to 1) lowers the direct sound to push a layer
+further away. `gate` makes any layer come and go (`on_s` / `off_s` ranges) and stop for good at `until_s`.
 See `sleepgen/layers.py` for each one's parameters.
 
 ## Tests

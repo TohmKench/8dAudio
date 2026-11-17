@@ -11,6 +11,7 @@ import subprocess
 
 import numpy as np
 
+from scipy import fft as sp_fft
 from scipy import signal
 
 from .dsp import SOS, SR, Noise, bandpass, highpass, lowpass, rms
@@ -53,47 +54,113 @@ class NoiseLayer(Layer):
         return x * self.gain
 
 
+class DropBank:
+    """Places many short drop sounds at random times, per channel, quickly.
+
+    Each drop is one of a bank of pre-made waveforms. Rather than looping over
+    thousands of drops per chunk, every waveform gets its own impulse train,
+    which is convolved once; the tail spills over into the next chunk.
+    """
+
+    def __init__(self, rng, kernels, channels=2):
+        self.rng = rng
+        self.kernels = kernels
+        self.tail = np.zeros((max(len(k) for k in kernels), channels))
+        self.channels = channels
+        self._spectra = {}
+
+    def __call__(self, n, rate):
+        out = np.zeros((n + len(self.tail), self.channels))
+        out[: len(self.tail)] += self.tail
+        nk = len(self.kernels)
+        k = self.rng.poisson(rate * n / SR * self.channels)
+        if k:
+            idx = self.rng.integers(0, n, k)
+            ch = self.rng.integers(0, self.channels, k)
+            which = self.rng.integers(0, nk, k)
+            # Capped so no single drop pokes out of the bed and startles a sleeper.
+            amp = np.minimum(self.rng.lognormal(0.0, 0.4, k), 2.0)
+            slot = (which * self.channels + ch) * n + idx
+            imp = np.bincount(slot, weights=amp, minlength=nk * self.channels * n)
+            imp = imp.reshape(nk, self.channels, n)
+            # One batched FFT for every waveform's impulse train, multiply by each
+            # waveform's spectrum, sum, then a single inverse FFT.
+            size = sp_fft.next_fast_len(n + len(self.tail))
+            if size not in self._spectra:
+                self._spectra = {size: np.stack([sp_fft.rfft(k, size) for k in self.kernels])}
+            spec = sp_fft.rfft(imp, size, axis=-1, workers=-1)
+            y = sp_fft.irfft(np.einsum("jcf,jf->cf", spec, self._spectra[size]), size, axis=-1, workers=-1)
+            out += y[:, : len(out)].T
+        self.tail = out[n:].copy()
+        return out[:n]
+
+
+def _bubble(rng, f_lo, f_hi, softness=1.0):
+    """One water-drop 'plink': a decaying sine whose pitch rises (a Minnaert bubble)."""
+    f0 = rng.uniform(f_lo, f_hi)
+    tau = softness * 1.6 / (0.13 * f0 + 0.0072 * f0 ** 1.5)
+    n = int(SR * tau * 6)
+    t = np.arange(n) / SR
+    sigma = rng.uniform(0.02, 0.07) * f0
+    phase = 2 * np.pi * f0 * (t + sigma * t ** 2 / 2)
+    env = np.exp(-t / tau) * (1 - np.exp(-t / 0.0004))
+    k = env * np.sin(phase)
+    return k / np.sqrt(np.sum(k ** 2))
+
+
+def _thud(rng, cutoff):
+    """A soft, dull impact: a tiny burst of low-passed noise."""
+    n = int(SR * rng.uniform(0.004, 0.012))
+    t = np.arange(n) / SR
+    k = rng.standard_normal(n) * np.exp(-t / (n / SR / 4))
+    k = signal.sosfilt(signal.butter(2, cutoff, "lowpass", fs=SR, output="sos"), k)
+    return k / np.sqrt(np.sum(k ** 2))
+
+
 class Rain(Layer):
-    """Synthetic rain: a hiss bed, fine patter and occasional heavier drops.
+    """Synthetic rain heard from indoors: a soft dark wash, many tiny impacts,
+    and water-drop 'plinks', rather than bright hiss.
 
     intensity  0..1  light drizzle to downpour
-    closeness  0..1  how many big close drops there are
+    closeness  0..1  how many big, close, lower drops there are
     gusts      0..1  depth of slow intensity swells
     """
 
     def __init__(self, rng, intensity=0.5, closeness=0.4, gusts=0.3, gust_period=75.0):
         self.rng = rng
-        self.hiss = Noise("pink", child(rng))
-        self.hiss_bp = bandpass(450, 9000)
-        self.patter_rate = 400 + 3200 * intensity
-        self.patter_bp = bandpass(1800, 7500)
-        self.drop_rate = 4 + 90 * intensity * closeness
-        self.drop_bp = bandpass(280, 1500)
-        self.tone = lowpass(8500)
+        self.wash = Noise("pink", child(rng))
+        self.wash_f = [highpass(120), lowpass(900 + 1400 * intensity, order=2)]
+        self.patter = DropBank(child(rng), [_thud(rng, rng.uniform(1500, 3000)) for _ in range(16)])
+        self.patter_rate = 500 + 3500 * intensity
+        self.plinks = DropBank(child(rng), [_bubble(rng, 1400, 3800) for _ in range(24)])
+        self.plink_rate = 30 + 250 * intensity
+        self.big = DropBank(child(rng), [_bubble(rng, 450, 1300, 1.4) for _ in range(10)]
+                            + [_thud(rng, rng.uniform(500, 900)) for _ in range(5)])
+        self.big_rate = 3 + 40 * intensity * closeness
+        self.tone = lowpass(5200, order=2)
         self.gusts = gusts
         self.gust_periods = [gust_period, gust_period * 0.43, gust_period * 2.7]
         self.gust_phases = rng.uniform(0, 2 * np.pi, 3)
         self.pos = 0
 
-        self.hiss_mix = 0.55 + 0.35 * intensity
-        self.patter_mix = 0.6
-        self.drop_mix = 0.2 + 0.35 * closeness
+        # Mix (relative loudness of each part, after each is set to unit level).
+        self.wash_mix = 0.45 + 0.35 * intensity
+        self.patter_mix = 0.55
+        self.plink_mix = 0.45
+        self.big_mix = 0.25 + 0.3 * closeness
 
-        self.hiss_g = self._unit(lambda k: self.hiss_bp(self.hiss(k)))
-        self.patter_g = self._unit(lambda k: self.patter_bp(self._impulses(k, self.patter_rate)))
-        self.drop_g = self._unit(lambda k: self.drop_bp(self._impulses(k, self.drop_rate)), seconds=20)
+        self.wash_g = self._unit(self._wash)
+        self.patter_g = self._unit(lambda k: self.patter(k, self.patter_rate))
+        self.plink_g = self._unit(lambda k: self.plinks(k, self.plink_rate))
+        self.big_g = self._unit(lambda k: self.big(k, self.big_rate), seconds=20)
         self.gain = 1.0
         self.gain = self._unit(self)
 
-    def _impulses(self, n, rate):
-        out = np.zeros((n, 2))
-        for c in range(2):
-            k = self.rng.poisson(rate * n / SR)
-            idx = self.rng.integers(0, n, k)
-            # Capped so no single drop pokes out of the bed and startles a sleeper.
-            amp = np.minimum(self.rng.lognormal(0.0, 0.45, k), 2.2) * self.rng.choice([-1.0, 1.0], k)
-            np.add.at(out[:, c], idx, amp)
-        return out
+    def _wash(self, n):
+        x = self.wash(n)
+        for f in self.wash_f:
+            x = f(x)
+        return x
 
     def __call__(self, n):
         t = (self.pos + np.arange(n)) / SR
@@ -101,10 +168,11 @@ class Rain(Layer):
         swell = np.sin(2 * np.pi * t[:, None] / np.array(self.gust_periods)[None, :]
                        + self.gust_phases[None, :]).mean(axis=1)
         g = (1.0 + self.gusts * 0.6 * swell)[:, None]
-        hiss = self.hiss_bp(self.hiss(n)) * self.hiss_g * self.hiss_mix
-        patter = self.patter_bp(self._impulses(n, self.patter_rate)) * self.patter_g * self.patter_mix
-        drops = self.drop_bp(self._impulses(n, self.drop_rate)) * self.drop_g * self.drop_mix
-        return self.tone((hiss + patter) * g + drops) * self.gain
+        wash = self._wash(n) * self.wash_g * self.wash_mix
+        patter = self.patter(n, self.patter_rate * float(g.mean())) * self.patter_g * self.patter_mix
+        plinks = self.plinks(n, self.plink_rate) * self.plink_g * self.plink_mix
+        big = self.big(n, self.big_rate) * self.big_g * self.big_mix
+        return self.tone(wash * g + patter + plinks + big) * self.gain
 
 
 class Thunder(Layer):
@@ -204,7 +272,7 @@ class Ocean(Layer):
         env = self._envelope(n)
         x = self.src(n)
         base = self.calm + (1 - self.calm) * env
-        out = self.body(x) * base * 1.4 + self.wash(x) * env ** 2
+        out = self.body(x) * base * 1.4 + self.wash(x) * 0.65 * env ** 2
         return out * self.gain
 
 
@@ -324,7 +392,7 @@ class Crickets(Layer):
                 offset=rng.uniform(0, 2), pan=rng.uniform(-0.8, 0.8), amp=rng.uniform(0.5, 1.0),
                 rest_period=rng.uniform(15, 50), rest_phase=rng.uniform(0, 2 * np.pi),
                 ph=rng.uniform(0, 2 * np.pi)))
-        self.distance = lowpass(6500 - 3000 * distance, order=2)
+        self.distance = lowpass(6500 - 3500 * distance, order=2)
         self.pos = 0
         self.gain = 1.0
         self.gain = self._unit(self, seconds=30)
