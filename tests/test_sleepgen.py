@@ -290,8 +290,12 @@ def test_fire_is_chunk_invariant_level_and_sleep_safe(env):
     np.testing.assert_allclose(a, b, atol=2e-4)
     assert 0.3 < rms(a) < 3.0
     assert np.corrcoef(a[:, 0], a[:, 1])[0, 1] < 0.9
-    # No crackle may jump far out of the bed: peaks stay within ~22 dB of the average.
-    assert 20 * np.log10(np.abs(a).max() / rms(a)) < 22.5
+    # No crackle may jump far out of the bed. Sample peaks stay within crest_db (20 dB) of
+    # the last couple of seconds' level (a 6 s window can sit a few dB under that)...
+    assert 20 * np.log10(np.abs(a).max() / rms(a)) < 24.0
+    # ...and what the ear hears as loudness (10 ms) never jumps far over the average.
+    ms = np.mean(a[: len(a) // 480 * 480] ** 2, axis=1).reshape(-1, 480).mean(axis=1)
+    assert 10 * np.log10(ms.max() / np.mean(a ** 2)) < 13.0
     # ...but they are there: strong crackles stand well clear of the bed.
     assert 20 * np.log10(np.percentile(np.abs(a), 99.99) / rms(a)) > 10
 
@@ -311,6 +315,22 @@ def test_fire_crackles_lead_a_quiet_bed():
         assert parts["crackle"] > parts["roar"] + 1.0
         assert parts["crackle"] > whole - 4
         assert parts["fizz"] < whole - 10 and parts["hiss"] < whole - 12
+
+
+def test_fire_cracks_have_no_pitched_ring():
+    """A pitched ring in the low treble, repeated through a crack's sputter, is how bubbling
+    liquid sounds: fire v2 had one and was heard as "wet globs". Below 4 kHz every mode of
+    a crack is broad (low Q) and gone within a couple of milliseconds."""
+    from sleepgen.fire import crack_colour, grain_modes, pop_modes
+
+    rng = np.random.default_rng(0)
+    for bright in (0.9, 1.1):
+        a = rng.uniform(0.1, 2.5, 3000)
+        fc = crack_colour(rng, a, bright)
+        for m in (pop_modes(rng, a, bright, fc), grain_modes(rng, a, fc), pop_modes(rng, a, bright)):
+            low = (m.f < 4000) & (m.amp != 0)
+            assert np.all(np.pi * m.f[low] * m.tau[low] < 5.0)
+            assert np.all(m.tau[low] < 1.5e-3)
 
 
 def test_peak_limiter_holds_its_limit_and_ignores_chunking():
