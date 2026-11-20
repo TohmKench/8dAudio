@@ -19,13 +19,16 @@ only in the first 45 to 60 minutes and then fade out, so nothing can startle som
 asleep. Accents are night sounds only: no daytime birdsong. The title headline is built from the
 tiers, e.g. "Gentle Rain with Distant Wind and Crickets".
 
-Needs Python 3.10+, `ffmpeg` on the PATH, and `pip install -r requirements.txt`.
+Needs Python 3.10+, `ffmpeg` on the PATH, and `pip install -r requirements.txt`. Rain is synthesised
+with PyTorch and is meant to run on a GPU (see "Running on the GPU" below).
 
 ## Quick start
 
 ```bash
 python -m sleepgen themes                                  # list themes
 python -m sleepgen previews -d previews --seconds 90       # a short clip of every theme
+python -m sleepgen previews --rain -d previews             # rain in every environment
+python -m sleepgen bench                                   # how fast this machine renders rain
 python -m sleepgen random -o out/video1.m4a --hours 10     # random theme, 10 hours
 python -m sleepgen random --theme rain --secondary wind --accent crickets -o out/v.m4a --hours 8
 python -m sleepgen recipe --theme ocean -o ocean.json      # save a recipe, edit it by hand...
@@ -43,16 +46,70 @@ recipe's `meta` block (theme, headline, features) feeds video titles and the wee
 - **One shared space.** All layers feed a convolution reverb with a natural, darkening tail. The
   base is mostly direct, secondaries sit further back, and accents are mostly reverb, so a cricket
   sounds like it's out in the garden, not in your ear.
-- **No surprises.** Rain drops are capped so none pokes out of the bed, thunder is rare, low and
+- **No surprises.** Rain gets lighter and heavier only over minutes, thunder is rare, low and
   distant, and slow level drift keeps it alive without anything sudden.
 - **No audible loop.** Everything is generated live, and library recordings are played as random
   stretches with crossfades between them.
 - **8D movement** (`pan.mode`: `sweep` or `circle`) is gentle by default (width 0.3 to 0.75) so it
   stays comfortable for someone lying on one ear. Binaural beats are never panned.
-- **Quality over speed.** Rain is built from thousands of individually modelled drops per second
-  (impacts plus pitched water "plinks"), with dozens of drop shapes for variety. A 10 hour layered
-  mix takes roughly 1 to 3 hours to render depending on the CPU. Audio streams to ffmpeg in
+- **Quality over speed.** Rain is built from up to 16,000 individually modelled drops per second on a
+  GPU (see below), each with its own size, speed, landing spot and sound. Audio streams to ffmpeg in
   10 second chunks, so memory stays flat, and output is 384 kbps AAC (YouTube's recommended rate).
+
+## Rain: physical scenes
+
+Rain is not a noise preset. `rainscene` places a listener in an environment and simulates the rain
+falling on everything around them, drop by drop:
+
+| Environment | What you hear |
+|---|---|
+| `roof` | Tile roof overhead (muffled through the ceiling), a side window, a gutter drip, the garden outside |
+| `tin_roof` | Corrugated metal sheets ringing above you, drips off the eaves |
+| `window` | Wind-driven rain on glass right beside you, a stone sill, the street and rooftops beyond |
+| `lake` | Rain on open water (tiny bubbles "fizz"), the shore, the treeline across the lake |
+| `forest` | Leaves of the canopy and understorey, heavy drips falling from the branches, the forest floor |
+| `tent` | Rain on taut fabric overhead, drips from the trees, wet grass, the woods around |
+
+What is modelled:
+
+- **Drops.** Sizes follow the Marshall-Palmer distribution for the rain rate, and each falls at its
+  terminal speed (drips from branches and eaves are slower and bigger). Heavier rain means more drops
+  *and* bigger drops, as in real rain.
+- **Impacts.** Each drop is a set of decaying resonances worked out from its size and speed: a short
+  click of contact, plus whatever the surface does next. Water traps a small bubble that rings
+  (Minnaert frequency) with a rising chirp; leaves and tiles give a short woody or stony ring.
+  Metal sheets, window panes and tent fabric are split into panels, each with its own vibration modes,
+  and a drop excites each mode by how its shape moves at the landing point.
+- **Space.** Every drop has a position in 3D. Its sound reaches each ear with the right delay, level,
+  head shadow, distance loss and air absorption, and through a ceiling, wall or glass where there is
+  one. All of it shares a small room or outdoor reverb. Listen on headphones.
+- **The rest of the rain.** The thousands of drops too far away or too small to render one by one are
+  added as a matching background whose spectrum is measured from the same drop models, kept under the
+  close drops (`bed_db`) so the scene never turns into static.
+- **Slow changes.** Rain rate and wind wander over minutes, with lighter and heavier spells across the
+  night. Nothing jumps.
+
+Recipe parameters: `environment`, `rain_mm_h` (light 1 to 2.5, moderate 2.5 to 7, heavy 7+), `wind_ms`,
+`variability`, `bed_db`, `diffuse_db`. The code is in `sleepgen/scene.py` (environments and rendering),
+`sleepgen/surfaces.py` (what a drop sounds like on each surface) and `sleepgen/rainphys.py` (the physics).
+
+## Running on the GPU
+
+`--device` picks where synthesis runs: `auto` (default) tries a CUDA-style GPU, then DirectML, then
+the CPU. `--quality` sets how many drops per second are modelled individually (default 16,000 on a GPU,
+2,500 on a CPU). More is more detail; the rest still comes from the matching background.
+
+On Windows with an AMD Radeon RX 9000 card (e.g. the RX 9060 XT), either:
+
+1. **AMD's PyTorch for Windows (ROCm), preferred.** Install it with AMD's "PyTorch on Windows" guide for
+   your Adrenalin driver version. The card then shows up to PyTorch as a CUDA device, and
+   `python -m sleepgen bench` prints `device: GPU: AMD Radeon RX 9060 XT`.
+2. **DirectML, fallback.** `pip install torch-directml` (it installs the PyTorch version it needs).
+   Works with any DirectX 12 GPU, usually slower than ROCm.
+
+Check it with `python -m sleepgen bench`, which renders a little rain in every environment and
+projects how long a 10 hour video takes. Force a device with `--device cuda` / `directml` / `cpu`
+(or `SLEEPGEN_DEVICE`).
 
 ## Sound library (optional)
 
@@ -77,9 +134,8 @@ at least 30 seconds long and free of voices, cars, birds and other sharp sounds.
   "master": {"target_lufs": -26, "lowpass_hz": 9000, "fade_in_s": 20, "fade_out_s": 45,
              "reverb": {"rt60": 2.2, "predelay_ms": 25, "damping": 0.6}},
   "layers": [
-    {"type": "rain", "level_db": 0, "params": {"intensity": 0.6, "closeness": 0.4},
-     "pan": {"mode": "circle", "width": 0.6, "period_s": 50},
-     "drift": {"depth_db": 1.5, "period_s": 120}},
+    {"type": "rainscene", "level_db": 0, "send": 0.05,
+     "params": {"environment": "window", "rain_mm_h": 4.0, "variability": 0.3}},
     {"type": "wind", "level_db": -10, "params": {"strength": 0.5}, "send": 0.35},
     {"type": "crickets", "level_db": -18, "params": {"count": 3}, "send": 0.75, "dry": 0.4,
      "gate": {"on_s": [20, 60], "off_s": [30, 120], "start_s": 40, "until_s": 3000, "until_fade_s": 300}}
@@ -89,10 +145,16 @@ at least 30 seconds long and free of voices, cars, birds and other sharp sounds.
 }
 ```
 
-Layer types: `noise`, `rain`, `thunder`, `ocean`, `fan`, `wind`, `crickets`, `binaural`, `drone`, `sample`.
+Layer types: `rainscene`, `noise`, `rain` (older, simpler rain), `thunder`, `ocean`, `fan`, `wind`, `crickets`, `binaural`, `drone`, `sample`.
 `send` (0 to 1) feeds the shared reverb and `dry` (0 to 1) lowers the direct sound to push a layer
 further away. `gate` makes any layer come and go (`on_s` / `off_s` ranges) and stop for good at `until_s`.
 See `sleepgen/layers.py` for each one's parameters.
+
+## Matching a reference recording
+
+`python -m sleepgen match reference.mp3 --base rain` tunes a base sound's settings and a matching EQ
+until its tone, drop density, graininess and swell are as close as possible to the reference, and
+writes the recipe, both clips and a similarity report to `matched/`.
 
 ## Tests
 

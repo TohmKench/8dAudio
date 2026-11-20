@@ -1,2 +1,4 @@
 numpy>=1.26
 scipy>=1.11
+# PyTorch: on an AMD GPU install AMD's ROCm build (or torch-directml) instead, see README.
+torch>=2.3

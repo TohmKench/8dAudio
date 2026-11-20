@@ -468,7 +468,14 @@ class Sample(Layer):
         return out * self.gain
 
 
+def _rainscene(rng, **params):
+    from .scene import RainScene  # imports PyTorch, so only when used
+
+    return RainScene(rng, **params)
+
+
 LAYER_TYPES = {
+    "rainscene": _rainscene,
     "noise": NoiseLayer,
     "rain": Rain,
     "thunder": Thunder,

@@ -170,9 +170,15 @@ class Reverb:
             ir += signal.sosfilt(sos, noise, axis=0) * decay[:, None]
         # Soft onset so the tail swells in rather than clicking.
         ir *= (1 - np.exp(-t / 0.012))[:, None]
-        for _ in range(6):  # early reflections
-            d = int(SR * rng.uniform(0.008, 0.07))
-            ir[d, rng.integers(0, channels)] += rng.uniform(0.3, 0.8) * rng.choice([-1, 1]) * 8
+        # Early reflections as short smeared bursts rather than single-sample spikes:
+        # spikes comb-filter the sound (fixed metallic stripes in the spectrum).
+        level = float(np.sqrt(np.mean(ir[: int(SR * 0.05)] ** 2)))
+        for _ in range(10):
+            d = int(SR * rng.uniform(0.004, 0.06))
+            w = int(SR * rng.uniform(0.0008, 0.0025))
+            burst = rng.standard_normal((w, channels)) * np.hanning(w)[:, None]
+            burst *= rng.uniform(0.8, 1.6) * level / max(float(np.sqrt(np.mean(burst ** 2))), 1e-12)
+            ir[d:d + w] += burst[: max(0, min(w, n - d))]
         pre = int(SR * predelay_ms / 1000)
         ir = np.concatenate([np.zeros((pre, channels)), ir])
         ir /= np.sqrt(np.sum(ir ** 2) / channels)

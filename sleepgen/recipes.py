@@ -62,23 +62,32 @@ def _sample(rng, ctx, categories, level=0.0):
 # --------------------------------------------------------------------------- bases
 # Each returns (layers, label). Layers are at 0 dB.
 
-def base_rain(rng, ctx):
-    intensity = _r(rng, 0.2, 0.95)
-    ctx["rain_intensity"] = intensity
-    layer = {"type": "rain", "level_db": 0.0,
-             "params": {"intensity": intensity, "closeness": _r(rng, 0.2, 0.8),
-                        "gusts": _r(rng, 0.1, 0.5), "gust_period": _r(rng, 45, 140, 0)},
-             "drift": _drift(rng, (0.5, 2.0))}
-    label = "Gentle Rain" if intensity < 0.45 else ("Heavy Rain" if intensity > 0.75 else "Rain")
-    if rng.random() < 0.25:
-        layer["pan"] = _pan(rng, "circle", (0.5, 0.75), (30, 70))
-        ctx["features"].append("8D Audio")
-    else:
-        layer["pan"] = _pan(rng, width=(0.15, 0.4))
+# Where the rain is falling, and how often each setting is picked.
+RAIN_ENVIRONMENTS = {"roof": 1.0, "window": 1.0, "tin_roof": 0.8, "forest": 1.0, "lake": 0.8, "tent": 0.8}
+RAIN_RATES = {"Gentle ": (1.0, 2.5), "": (2.5, 7.0), "Heavy ": (7.0, 16.0)}  # mm/h
+
+
+def base_rain(rng, ctx, environment=None):
+    """Physically modelled rain falling on a real place (scene.py)."""
+    from .scene import ENVIRONMENTS
+
+    if environment is None:
+        names = sorted(RAIN_ENVIRONMENTS)
+        w = np.array([RAIN_ENVIRONMENTS[n] for n in names])
+        environment = str(rng.choice(names, p=w / w.sum()))
+    word = str(rng.choice(list(RAIN_RATES), p=[0.35, 0.4, 0.25]))
+    rate = _r(rng, *RAIN_RATES[word], 1)
+    ctx["rain_intensity"] = min(1.0, rate / 8.0)
+    ctx["environment"] = environment
+    ctx["features"].append("3D Audio")
+    layer = {"type": "rainscene", "level_db": 0.0,
+             "params": {"environment": environment, "rain_mm_h": rate, "variability": _r(rng, 0.2, 0.4)},
+             "send": _r(rng, 0.0, 0.08)}  # the scene has its own room/space
     layers = [layer]
-    if library_files(ctx["library"], ["rain", "rain_roof", "rain_window"]) and rng.random() < 0.7:
-        layers.append(_sample(rng, ctx, ["rain", "rain_roof", "rain_window"], _r(rng, -6, 0, 1)))
-    return layers, label
+    cats = {"roof": ["rain_roof"], "window": ["rain_window"], "lake": ["rain"], "forest": ["rain"]}.get(environment, [])
+    if library_files(ctx["library"], cats) and rng.random() < 0.5:
+        layers.append(_sample(rng, ctx, cats, _r(rng, -12, -6, 1)))
+    return layers, word + ENVIRONMENTS[environment]["title"]
 
 
 def base_ocean(rng, ctx):
@@ -160,9 +169,9 @@ def sec_drone(rng, ctx, level):
 
 
 def sec_light_rain(rng, ctx, level):
-    return {"type": "rain", "level_db": level,
-            "params": {"intensity": _r(rng, 0.2, 0.5), "closeness": _r(rng, 0.1, 0.4), "gusts": _r(rng, 0.1, 0.3)},
-            "drift": _drift(rng, (0.5, 2.0))}, "Soft Rain"
+    env = str(rng.choice(["window", "roof"]))
+    return {"type": "rainscene", "level_db": level,
+            "params": {"environment": env, "rain_mm_h": _r(rng, 1.0, 3.0, 1), "variability": 0.25}}, "Soft Rain"
 
 
 def sec_fire(rng, ctx, level):
@@ -339,7 +348,9 @@ def random_recipe(seed: int | None = None, theme: str | None = None, library: st
     }
     if ctx["sources"]:
         meta["sources"] = ctx["sources"]
-    master = {"lowpass_hz": int(rng.uniform(7000, 12000)), "fade_in_s": 20, "fade_out_s": 45,
+    # Physically modelled rain carries real high-frequency detail; don't dull it much.
+    lp = (13000, 16000) if theme == "rain" else (7000, 12000)
+    master = {"lowpass_hz": int(rng.uniform(*lp)), "fade_in_s": 20, "fade_out_s": 45,
               "reverb": {"rt60": _r(rng, 1.6, 3.2), "predelay_ms": _r(rng, 15, 40, 0),
                          "damping": _r(rng, 0.4, 0.8), "level": 1.0}}
     return {"version": 2, "seed": seed, "master": master, "layers": layers, "meta": meta}

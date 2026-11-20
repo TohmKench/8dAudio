@@ -27,6 +27,9 @@ def _length(args) -> float:
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="sleepgen", description="Long, calm soundscapes for sleep videos.")
+    p.add_argument("--device", help="auto (default), gpu, cuda, rocm, directml or cpu")
+    p.add_argument("--quality", type=int,
+                   help="individually synthesised raindrops per second (default 16000 on GPU, 2500 on CPU)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("themes", help="list bases, secondaries and accents")
@@ -66,6 +69,11 @@ def main(argv=None) -> int:
     pv.add_argument("--seconds", type=float, default=90)
     pv.add_argument("--seed", type=int, default=1)
     pv.add_argument("--library")
+    pv.add_argument("--rain", action="store_true", help="one clip of rain in every environment instead")
+
+    bn = sub.add_parser("bench", help="time rain rendering on this machine and project a 10 hour render")
+    bn.add_argument("--seconds", type=float, default=20)
+    bn.add_argument("--environment", action="append")
 
     mt = sub.add_parser("match", help="tune a base sound to match a reference recording")
     mt.add_argument("reference")
@@ -74,6 +82,34 @@ def main(argv=None) -> int:
     mt.add_argument("--evals", type=int, default=70)
 
     args = p.parse_args(argv)
+    if args.quality:
+        os.environ["SLEEPGEN_QUALITY"] = str(args.quality)
+    if args.device:
+        from . import gpu
+        gpu.set_device(args.device)
+
+    if args.cmd == "bench":
+        import time
+        import numpy as np
+        from . import gpu
+        from .dsp import SR
+        from .scene import ENVIRONMENTS, RainScene
+        print(f"device: {gpu.describe()}   drops/s budget: {gpu.default_budget()}")
+        worst = 0.0
+        for env in args.environment or list(ENVIRONMENTS):
+            t = time.time()
+            s = RainScene(np.random.default_rng(1), environment=env, rain_mm_h=6.0)
+            t_init = time.time() - t
+            t = time.time()
+            for _ in range(int(args.seconds // 10)):
+                s(SR * 10)
+            spent = time.time() - t
+            per_hour = spent / (args.seconds // 10 * 10) * 3600
+            worst = max(worst, per_hour)
+            print(f"{env:9s} {args.seconds / spent:6.1f}x realtime   10 h would take {per_hour * 10 / 60:6.1f} min"
+                  f"   (setup {t_init:.1f}s)")
+        print(f"slowest environment: 10 h in about {worst * 10 / 60:.0f} min")
+        return 0
 
     if args.cmd == "match":
         from .match import run
@@ -111,6 +147,19 @@ def main(argv=None) -> int:
               file=sys.stderr)
         report = render_with_sidecar(recipe, args.out, _length(args), bitrate=args.bitrate)
         print(json.dumps(report, indent=2))
+        return 0
+
+    if args.cmd == "previews" and args.rain:
+        from .scene import ENVIRONMENTS
+        os.makedirs(args.dir, exist_ok=True)
+        for env in ENVIRONMENTS:
+            recipe = random_recipe(args.seed, "rain", args.library, secondaries=[], accents=[])
+            recipe["layers"][0]["params"]["environment"] = env
+            recipe["meta"]["headline"] = ENVIRONMENTS[env]["title"]
+            recipe["master"].update(fade_in_s=3, fade_out_s=3)
+            out = os.path.join(args.dir, f"rain-{env}.mp3")
+            report = render_with_sidecar(recipe, out, args.seconds, bitrate="256k", progress=False)
+            print(f"{env:9s} {report['render_seconds']:6.1f}s  -> {out}")
         return 0
 
     if args.cmd == "previews":

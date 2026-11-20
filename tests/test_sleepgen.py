@@ -185,3 +185,80 @@ def test_match_measures_and_eq():
     d = flat.delay
     np.testing.assert_allclose(y[d:], x[:-d], atol=2e-3)
     assert all(abs(g) < 1e-9 for _, g in match_eq(m, m))
+
+
+# -- rain scene (physical, per-drop) ---------------------------------------------------
+
+from sleepgen import rainphys as P  # noqa: E402
+from sleepgen.dsp import rms  # noqa: E402
+from sleepgen.scene import ENVIRONMENTS, RainScene  # noqa: E402
+from sleepgen.surfaces import PLATE_MATERIALS, SHORT_L, make_surface  # noqa: E402
+
+
+def _scene_out(env, chunk_s, seconds=3.0, seed=3, **kw):
+    s = RainScene(np.random.default_rng(seed), environment=env, rain_mm_h=5.0, budget=600, **kw)
+    n, chunk, out = int(seconds * SR), int(chunk_s * SR), []
+    while n > 0:
+        k = min(chunk, n)
+        out.append(s(k))
+        n -= k
+    return np.concatenate(out)
+
+
+@pytest.mark.parametrize("env", list(ENVIRONMENTS))
+def test_rain_scene_is_chunk_invariant_and_level(env):
+    """Each environment renders, has no seams at chunk edges, and comes out near unit level."""
+    a = _scene_out(env, 1.0)
+    b = _scene_out(env, 0.37)
+    assert np.all(np.isfinite(a))
+    np.testing.assert_allclose(a, b, atol=2e-4)
+    assert 0.3 < rms(a) < 3.0
+    # Stereo, not mono: the ears hear different drops at different times.
+    assert np.corrcoef(a[:, 0], a[:, 1])[0, 1] < 0.95
+
+
+def test_rain_scene_is_deterministic():
+    np.testing.assert_allclose(_scene_out("window", 1.0, 2.0, seed=9), _scene_out("window", 1.0, 2.0, seed=9),
+                               atol=1e-6)
+    assert not np.allclose(_scene_out("window", 1.0, 2.0, seed=9), _scene_out("window", 1.0, 2.0, seed=10))
+
+
+def test_rain_scene_bed_stays_under_the_drops():
+    """The diffuse field never outweighs the individually heard drops (that is what reads as static)."""
+    for env in ("forest", "roof"):
+        s = RainScene(np.random.default_rng(1), environment=env, rain_mm_h=6.0, budget=600, bed_db=-6.0)
+        if s.diffuse is None:
+            continue
+        twin = RainScene(np.random.default_rng(1), environment=env, rain_mm_h=6.0, budget=600, calibrate=False)
+        twin.diffuse, twin.room = None, None
+        ind = rms(twin(SR * 3))
+        bed = float(np.sqrt(np.sum(s.diffuse.h ** 2))) * s.diffuse_gain
+        assert bed <= 10 ** (-6 / 20) * ind * 1.6
+
+
+@pytest.mark.parametrize("kind", ["water", "water_drip", "leaf", "ground", "tile", *PLATE_MATERIALS])
+def test_every_surface_gives_sane_modes(kind):
+    rng = np.random.default_rng(4)
+    surf = make_surface(kind, rng, (3.0, 2.0))
+    d = P.sample_diameters(rng, 50, 5.0, P.D_MIN, P.D_MAX)
+    v = P.fall_velocity(d, 10.0)
+    uv = rng.random((50, 2))
+    m = surf.voice(rng, d, v, uv)
+    f, tau, amp = m.f, m.tau, m.amp
+    assert f.shape == tau.shape == amp.shape and f.shape[0] == 50
+    assert np.all(np.isfinite(f)) and np.all(np.isfinite(amp)) and np.all(np.isfinite(tau))
+    assert np.all(f > 0) and np.all(f < SR / 2)
+    assert np.all(tau > 0)
+    # Every mode has died away (-40 dB) inside the window rendered for each drop.
+    assert np.all(tau * 4.6 * SR <= surf.L * 1.001)
+    assert np.all(tau[:, : m.n_short] * 4.6 * SR <= SHORT_L * 1.001)
+
+
+def test_rain_physics_basics():
+    # Bigger drops fall faster and hit harder; heavier rain has more big drops.
+    v = P.terminal_velocity(np.array([0.5, 1.0, 2.0, 4.0]))
+    assert np.all(np.diff(v) > 0) and 8.0 < v[-1] < 10.0
+    assert P.mp_lambda(10.0) < P.mp_lambda(1.0)
+    # A drip from a 2 m branch is slower than terminal velocity.
+    assert P.fall_velocity(np.array([4.0]), 2.0)[0] < P.terminal_velocity(np.array([4.0]))[0]
+    assert P.minnaert_hz(1.0) == pytest.approx(3260, rel=0.01)  # 1 mm bubble radius
