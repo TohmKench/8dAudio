@@ -37,7 +37,7 @@ def test_chunk_size_does_not_change_output(spec):
 
 
 @pytest.mark.parametrize("theme", available_bases())
-def test_every_theme_renders_to_target(theme, tmp_path):
+def test_every_base_renders_to_target(theme, tmp_path):
     recipe = random_recipe(11, theme)
     json.dumps(recipe)  # recipes must be plain JSON
     recipe["master"].update(fade_in_s=3, fade_out_s=3)
@@ -93,7 +93,7 @@ def test_sidecar_written(tmp_path):
     out = tmp_path / "v.m4a"
     engine.render_with_sidecar(random_recipe(2, "fan"), str(out), 5, progress=False)
     side = json.loads((tmp_path / "v.json").read_text())
-    assert side["recipe"]["meta"]["theme"] == "fan"
+    assert side["recipe"]["meta"]["base"] == "fan"
     assert os.path.getsize(out) > 10_000
 
 
@@ -112,30 +112,71 @@ def test_library_only_parts_need_the_library(tmp_path):
         random_recipe(1, "stream")
     lib = _lib(tmp_path, "stream", "owl")
     assert "stream" in available_bases(lib)
-    r = random_recipe(1, "stream", library=lib, accents=["owl"])
+    r = random_recipe(1, "stream", library=lib, tertiaries=["owl"])
     assert r["meta"]["headline"].endswith("Owl")
     assert r["meta"]["sources"]
 
 
-def test_tiers_and_headline():
-    r = random_recipe(4, "rain", secondaries=["noise_bed", "wind"], accents=["crickets"])
+def test_four_tiers_and_headline():
+    r = random_recipe(4, "rain", secondaries=["noise_bed", "wind"], tertiaries=["crickets"],
+                      modifier="window", strength="gentle")
     m = r["meta"]
-    assert m["secondaries"] == ["noise_bed", "wind"] and m["accents"] == ["crickets"]
-    assert m["headline"].endswith("with Distant Wind and Crickets")
-    assert m["combo"] == "rain+noise_bed+wind+crickets"
+    assert (m["base"], m["modifier"], m["strength"]) == ("rain", "window", "gentle")
+    assert m["secondaries"] == ["noise_bed", "wind"] and m["tertiaries"] == ["crickets"]
+    assert m["headline"] == "Gentle Rain on the Window with Distant Wind and Crickets"
+    assert m["combo"] == "rain/window+noise_bed+wind+crickets"
+    assert r["layers"][0]["params"]["environment"] == "window" and r["layers"][0]["params"]["rain_mm_h"] <= 2.5
     levels = [l["level_db"] for l in r["layers"]]
     assert levels[0] == 0 and all(-22 <= v <= -6 for v in levels[1:])
-    assert r["layers"][-1]["send"] > 0.5 and r["layers"][-1]["dry"] < 0.6  # accents sit far away
+    assert r["layers"][-1]["send"] > 0.5 and r["layers"][-1]["dry"] < 0.6  # night sounds sit far away
+    assert 2700 <= m["tertiaries_until_s"] <= 3600  # sleep video: they stop within the hour
+    assert r["layers"][-1]["gate"]["until_s"] == m["tertiaries_until_s"]
+
+
+def test_study_videos_keep_their_tertiaries_all_video():
+    r = random_recipe(4, "rain", tertiaries=["crickets"], video_type="study")
+    assert r["meta"]["video_type"] == "study" and r["meta"]["tertiaries_until_s"] is None
+    assert "until_s" not in r["layers"][-1]["gate"]
+
+
+def test_modifiers_and_strengths_are_checked():
+    with pytest.raises(ValueError):
+        random_recipe(1, "rain", modifier="campfire")
+    with pytest.raises(ValueError):
+        random_recipe(1, "noise", modifier="pink", strength="deep")  # pink noise is soft or bright
+    for seed in range(20):
+        m = random_recipe(seed, "noise")["meta"]
+        assert m["strength"] in BASES["noise"]["strengths_for"][m["modifier"]]
 
 
 def test_bases_only_offer_known_parts():
-    from sleepgen.recipes import ACCENTS, SECONDARIES
+    from sleepgen.recipes import SECONDARIES, TERTIARIES
     for spec in BASES.values():
         assert set(spec["secondaries"]) <= set(SECONDARIES)
-        assert set(spec["accents"]) <= set(ACCENTS)
+        assert set(spec["tertiaries"]) <= set(TERTIARIES)
+        assert spec["indoor"] is None or spec["indoor"] <= set(spec["modifiers"])
+        for m in spec["modifiers"]:
+            assert set(spec.get("strengths_for", {}).get(m, spec["strengths"])) <= set(spec["strengths"])
 
 
-def test_accents_come_and_go_then_stop():
+def test_scenes_fix_every_tier():
+    from sleepgen.recipes import SCENES, available_scenes, scene_recipe, scene_status
+    ready = available_scenes()
+    assert "rainy_fireside" in ready and "beach_night" in ready
+    for name in ready:
+        s, r = SCENES[name], scene_recipe(name, 3)
+        m = r["meta"]
+        assert (m["scene"], m["headline"], m["video_type"]) == (name, s["title"], s["type"])
+        assert (m["base"], m["modifier"], m["strength"]) == (s["base"], s["modifier"], s["strength"])
+        assert m["secondaries"] == s["secondaries"]
+        assert m["tertiaries"] == [t for t in s["tertiaries"] if not t.endswith("?")]  # no library here
+        json.dumps(r)
+    assert "night_train" in " ".join(scene_status("sleeper_train"))
+    with pytest.raises(ValueError):
+        scene_recipe("sleeper_train")  # not built yet
+
+
+def test_tertiaries_come_and_go_then_stop():
     spec = {"type": "crickets", "params": {}, "gate": {"on_s": [5, 5], "off_s": [10, 10], "start_s": 2,
                                                        "until_s": 60, "until_fade_s": 10}}
     x = _render_raw({"seed": 1, "layers": [spec]}, 80, 1)
@@ -394,7 +435,7 @@ def test_fire_recipes_fit_the_setting():
         if FIRE_ENVIRONMENTS[env]["outdoor"]:
             assert "light_rain" not in r["meta"]["secondaries"]
         else:
-            assert not set(r["meta"]["accents"]) & {"crickets", "owl", "frogs"}
+            assert not set(r["meta"]["tertiaries"]) & {"crickets", "owl", "frogs"}
         r = random_recipe(seed, "rain")
         if r["layers"][0]["params"]["environment"] in ("lake", "forest", "tent"):
             assert "fire" not in r["meta"]["secondaries"]

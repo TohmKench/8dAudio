@@ -1,11 +1,14 @@
 """Command line for sleepgen.
 
-  python -m sleepgen themes
-  python -m sleepgen recipe --theme rain --seed 7 -o rain.json
+  python -m sleepgen catalog                                   (bases, modifiers, secondaries, tertiaries, scenes)
+  python -m sleepgen recipe --base rain --seed 7 -o rain.json
   python -m sleepgen render rain.json -o rain.m4a --hours 10
-  python -m sleepgen random -o out/video.m4a --hours 10 [--theme ocean] [--library sounds/]
-  python -m sleepgen random --theme rain --secondary wind --accent crickets -o out/v.m4a
+  python -m sleepgen random -o out/video.m4a --hours 10 [--base ocean] [--library sounds/]
+  python -m sleepgen random --base rain --modifier window --strength gentle --secondary wind \
+         --tertiary crickets -o out/v.m4a
+  python -m sleepgen random --scene rainy_study_window -o out/study.m4a --hours 8
   python -m sleepgen previews -d previews --seconds 90
+  python -m sleepgen previews --scenes -d previews             (one clip of every scene that is built)
   python -m sleepgen previews --rain --rate 4 -d previews      (rain in every environment)
   python -m sleepgen previews --fire -d previews               (fire in every setting)
   python -m sleepgen bench                                     (GPU speed check, synthesis only)
@@ -20,7 +23,8 @@ import os
 import sys
 
 from .engine import render_with_sidecar
-from .recipes import ACCENTS, BASES, SECONDARIES, available_bases, random_recipe
+from .recipes import (BASES, SCENES, SECONDARIES, TERTIARIES, available_bases, random_recipe, scene_recipe,
+                      scene_status, strengths_for)
 
 
 def _length(args) -> float:
@@ -36,15 +40,21 @@ def main(argv=None) -> int:
                    help="individually synthesised raindrops per second (default 16000 on GPU, 2500 on CPU)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("themes", help="list bases, secondaries and accents")
+    sub.add_parser("catalog", aliases=["themes"], help="list bases, modifiers, secondaries, tertiaries and scenes")
 
     def add_tiers(sp):
-        sp.add_argument("--theme", help="base sound (random if omitted)")
+        sp.add_argument("--base", "--theme", dest="base", help="base sound (random if omitted)")
+        sp.add_argument("--modifier", help="the base's place or kind, e.g. window, campfire, brown")
+        sp.add_argument("--strength", help="e.g. gentle, steady, heavy (see `catalog`)")
         sp.add_argument("--secondary", action="append", choices=sorted(SECONDARIES),
                         help="force a secondary (repeatable); default: 0-2 at random")
         sp.add_argument("--no-secondary", action="store_true")
-        sp.add_argument("--accent", action="append", choices=sorted(ACCENTS), help="force an accent")
-        sp.add_argument("--no-accent", action="store_true")
+        sp.add_argument("--tertiary", action="append", choices=sorted(TERTIARIES),
+                        help="force a tertiary (repeatable); default: 0-2 at random")
+        sp.add_argument("--no-tertiary", action="store_true")
+        sp.add_argument("--study", action="store_true",
+                        help="a study video: tertiaries keep going all video instead of stopping after ~1 h")
+        sp.add_argument("--scene", choices=sorted(SCENES), help="a scene preset (fixes all four tiers)")
         sp.add_argument("--seed", type=int)
         sp.add_argument("--library", help="folder of library sounds, one subfolder per category")
 
@@ -77,6 +87,7 @@ def main(argv=None) -> int:
     pv.add_argument("--rate", type=float, help="with --rain: rainfall in mm/h (default: random per seed)")
     pv.add_argument("--fire", action="store_true", help="one clip of fire in every setting instead")
     pv.add_argument("--intensity", type=float, help="with --fire: 0.5 gentle .. 1.3 roaring (default: random)")
+    pv.add_argument("--scenes", action="store_true", help="one clip of every scene that is built instead")
 
     bn = sub.add_parser("bench", help="time rain/fire rendering on this machine and project a 10 hour render")
     bn.add_argument("--seconds", type=float, default=20)
@@ -111,8 +122,8 @@ def main(argv=None) -> int:
         for env in args.environment or list(ENVIRONMENTS) + list(FIRE_ENVIRONMENTS):
             fire = env in FIRE_ENVIRONMENTS
             if args.full:
-                recipe = random_recipe(1, "fire" if fire else "rain", None, secondaries=[], accents=[])
-                recipe["layers"][0]["params"]["environment"] = env
+                recipe = random_recipe(1, "fire" if fire else "rain", None, secondaries=[], tertiaries=[],
+                                       modifier=env)
                 if not fire:
                     recipe["layers"][0]["params"]["rain_mm_h"] = 6.0
                 with tempfile.TemporaryDirectory() as tmp:
@@ -145,22 +156,36 @@ def main(argv=None) -> int:
         return 0
 
     def make(a):
+        if a.scene:
+            return scene_recipe(a.scene, a.seed, a.library)
         sec = [] if a.no_secondary else a.secondary
-        acc = [] if a.no_accent else a.accent
-        return random_recipe(a.seed, a.theme, a.library, secondaries=sec, accents=acc)
+        ter = [] if a.no_tertiary else a.tertiary
+        return random_recipe(a.seed, a.base, a.library, secondaries=sec, tertiaries=ter, modifier=a.modifier,
+                             strength=a.strength, video_type="study" if a.study else "sleep")
 
-    if args.cmd == "themes":
+    if args.cmd in ("catalog", "themes"):
+        print("BASES  (modifiers: strengths)")
         for name, spec in sorted(BASES.items()):
             needs = f"  (needs library: {', '.join(spec['needs'])})" if spec.get("needs") else ""
-            print(f"{name}{needs}\n  secondaries: {', '.join(spec['secondaries']) or '-'}"
-                  f"\n  accents:     {', '.join(spec['accents']) or '-'}")
+            mods = ", ".join(f"{m}: {'/'.join(strengths_for(name, m))}" for m in spec["modifiers"])
+            print(f"  {name}{needs}\n    modifiers:   {mods}"
+                  f"\n    secondaries: {', '.join(spec['secondaries']) or '-'}"
+                  f"\n    tertiaries:  {', '.join(spec['tertiaries']) or '-'}")
+        print("SECONDARIES\n  " + ", ".join(sorted(SECONDARIES)))
+        print("TERTIARIES\n  " + ", ".join(f"{n} ({'/'.join(sorted(t['types']))})"
+                                          for n, t in sorted(TERTIARIES.items())))
+        print("SCENES")
+        for name, s in SCENES.items():
+            missing = scene_status(name, getattr(args, "library", None))
+            state = "ready" if not missing else "needs " + ", ".join(missing)
+            print(f"  {name:20s} {s['type']:5s}  {s['title']}  [{state}]")
         return 0
 
     if args.cmd == "recipe":
         recipe = make(args)
         with open(args.out, "w") as f:
             json.dump(recipe, f, indent=2)
-        print(f"{recipe['meta']['theme']} (seed {recipe['seed']}) -> {args.out}")
+        print(f"{recipe['meta']['combo']} (seed {recipe['seed']}) -> {args.out}")
         return 0
 
     if args.cmd in ("render", "random"):
@@ -180,8 +205,7 @@ def main(argv=None) -> int:
         from .scene import ENVIRONMENTS
         os.makedirs(args.dir, exist_ok=True)
         for env in ENVIRONMENTS:
-            recipe = random_recipe(args.seed, "rain", args.library, secondaries=[], accents=[])
-            recipe["layers"][0]["params"]["environment"] = env
+            recipe = random_recipe(args.seed, "rain", args.library, secondaries=[], tertiaries=[], modifier=env)
             if args.rate:
                 recipe["layers"][0]["params"]["rain_mm_h"] = args.rate
             recipe["meta"]["headline"] = ENVIRONMENTS[env]["title"]
@@ -195,15 +219,25 @@ def main(argv=None) -> int:
         from .fire import FIRE_ENVIRONMENTS
         os.makedirs(args.dir, exist_ok=True)
         for env in FIRE_ENVIRONMENTS:
-            recipe = random_recipe(args.seed, "fire", args.library, secondaries=[], accents=[])
-            recipe["layers"][0]["params"]["environment"] = env
+            recipe = random_recipe(args.seed, "fire", args.library, secondaries=[], tertiaries=[], modifier=env)
             if args.intensity:
                 recipe["layers"][0]["params"]["intensity"] = args.intensity
-            recipe["meta"]["headline"] = recipe["meta"]["base_label"] = FIRE_ENVIRONMENTS[env]["title"]
+            recipe["meta"]["headline"] = recipe["meta"]["base_title"] = FIRE_ENVIRONMENTS[env]["title"]
             recipe["master"].update(fade_in_s=3, fade_out_s=3)
             out = os.path.join(args.dir, f"fire-{env}.mp3")
             report = render_with_sidecar(recipe, out, args.seconds, bitrate="256k", progress=False)
             print(f"{env:10s} {report['render_seconds']:6.1f}s  peak {report['peak_dbfs']} dBFS  -> {out}")
+        return 0
+
+    if args.cmd == "previews" and args.scenes:
+        from .recipes import available_scenes
+        os.makedirs(args.dir, exist_ok=True)
+        for name in available_scenes(args.library):
+            recipe = scene_recipe(name, args.seed, args.library)
+            recipe["master"].update(fade_in_s=3, fade_out_s=3)
+            out = os.path.join(args.dir, f"scene-{name}.mp3")
+            report = render_with_sidecar(recipe, out, args.seconds, bitrate="256k", progress=False)
+            print(f"{name:20s} {report['render_seconds']:6.1f}s  peak {report['peak_dbfs']} dBFS  -> {out}")
         return 0
 
     if args.cmd == "previews":

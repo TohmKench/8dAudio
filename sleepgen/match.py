@@ -125,7 +125,7 @@ def _recipe(base: str, params: dict, eq=None, seed=1) -> dict:
         master["eq"] = eq
     return {"seed": seed, "master": master,
             "layers": [{"type": base, "level_db": 0.0, "params": params, "send": 0.18}],
-            "meta": {"theme": base, "headline": f"matched {base}"}}
+            "meta": {"base": base, "headline": f"matched {base}"}}
 
 
 def _synth(recipe: dict, seconds: float) -> np.ndarray:
