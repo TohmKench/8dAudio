@@ -54,9 +54,9 @@ NC = UNIT // CTRL
 WOODS = {
     # crackle rate (per s at full intensity), cluster size, size-law exponent (lower = more
     # big pops), brightness, sap whistles per minute at full dampness
-    "softwood": dict(rate=(6.0, 10.0), cascade=2.0, alpha=2.1, bright=1.1, whistle=0.8, hiss=1.0),
-    "mixed": dict(rate=(4.0, 7.0), cascade=1.5, alpha=2.3, bright=1.0, whistle=0.4, hiss=0.8),
-    "hardwood": dict(rate=(2.2, 4.5), cascade=1.1, alpha=2.6, bright=0.9, whistle=0.15, hiss=0.6),
+    "softwood": dict(rate=(1.5, 2.6), cascade=1.2, alpha=2.1, bright=1.1, whistle=0.8, hiss=1.0),
+    "mixed": dict(rate=(1.0, 1.8), cascade=0.9, alpha=2.3, bright=1.0, whistle=0.4, hiss=0.8),
+    "hardwood": dict(rate=(0.55, 1.1), cascade=0.6, alpha=2.6, bright=0.9, whistle=0.15, hiss=0.6),
 }
 
 
@@ -85,7 +85,7 @@ def env_campfire(rng):
         title="Crackling Campfire",
         center=(_side(rng) * rng.uniform(0.0, 0.6), rng.uniform(1.6, 2.4), -0.6),
         size=(0.7, 0.7, 0.45), diameter=rng.uniform(0.5, 0.8), roar_hz=rng.uniform(170, 250),
-        coherence=0.45, mix_db=dict(roar=0.0, fizz=-11.0, hiss=-20.0, crackle=1.0),
+        coherence=0.45, mix_db=dict(roar=0.0, fizz=-11.0, hiss=-20.0, crackle=-6.0),
         room=dict(rt60=0.3, predelay_ms=12, damping=0.6, wet=0.05),  # trees and ground nearby
     )
 
@@ -96,7 +96,7 @@ def env_fireplace(rng):
         title="Crackling Fireplace",
         center=(_side(rng) * rng.uniform(0.4, 1.4), rng.uniform(2.5, 3.8), -0.45),
         size=(0.6, 0.35, 0.35), diameter=rng.uniform(0.35, 0.55), roar_hz=rng.uniform(130, 200),
-        coherence=0.65, mix_db=dict(roar=0.0, fizz=-12.0, hiss=-21.0, crackle=1.0),
+        coherence=0.65, mix_db=dict(roar=0.0, fizz=-12.0, hiss=-21.0, crackle=-6.0),
         transmission=(rng.uniform(5000, 8000), 1, 1.0),  # the hearth opening shades the top end
         room=dict(rt60=rng.uniform(0.45, 0.7), predelay_ms=8, damping=0.65, wet=0.22),
     )
@@ -108,7 +108,7 @@ def env_wood_stove(rng):
         title="Wood Stove Fire",
         center=(_side(rng) * rng.uniform(0.6, 1.5), rng.uniform(2.0, 3.0), -0.4),
         size=(0.35, 0.25, 0.25), diameter=rng.uniform(0.25, 0.35), roar_hz=rng.uniform(110, 170),
-        coherence=0.75, mix_db=dict(roar=0.0, fizz=-15.0, hiss=-24.0, crackle=1.0),
+        coherence=0.75, mix_db=dict(roar=0.0, fizz=-15.0, hiss=-24.0, crackle=-6.0),
         rate_scale=0.8, transmission=(rng.uniform(1300, 2200), 1, 1.0),
         room=dict(rt60=rng.uniform(0.4, 0.6), predelay_ms=6, damping=0.7, wet=0.2), ticks=True,
     )
@@ -120,8 +120,8 @@ def env_bonfire(rng):
         title="Bonfire at Night",
         center=(_side(rng) * rng.uniform(0.0, 1.0), rng.uniform(4.5, 7.0), -0.2),
         size=(2.0, 2.0, 1.4), diameter=rng.uniform(1.5, 2.5), roar_hz=rng.uniform(70, 120),
-        coherence=0.35, mix_db=dict(roar=0.0, fizz=-10.0, hiss=-19.0, crackle=1.0),
-        rate_scale=2.5, room=dict(rt60=0.5, predelay_ms=20, damping=0.6, wet=0.08),
+        coherence=0.35, mix_db=dict(roar=0.0, fizz=-10.0, hiss=-19.0, crackle=-6.0),
+        rate_scale=1.6, room=dict(rt60=0.5, predelay_ms=20, damping=0.6, wet=0.08),
     )
 
 
@@ -359,7 +359,7 @@ class FireScene(Layer):
         self.fizz_amp = np.sqrt(self.fizz_phys / self.fizz_rate)  # fewer ticks, same energy
         self.pop_cap = 2.5  # biggest pop, relative to a typical one (soft limit)
         self.crest_db = crest_db
-        self.limiter = PeakLimiter(10 ** (crest_db / 20), relative_s=2.0)  # output is ~unit RMS
+        self.limiter = PeakLimiter(10 ** (crest_db / 20), window_ms=5.0, relative_s=2.0)  # output is ~unit RMS
         self.gain = None  # set by _calibrate
         self.mute = set()  # parts to leave out (for listening to one part alone)
 
@@ -438,7 +438,7 @@ class FireScene(Layer):
         a = (1 - rng.random(k)) ** (-1 / self.alpha) / 2 ** (1 / self.alpha)  # Pareto, median 1
         # Heard sizes are gentler than the physics (a fire close by has some loud pops; for
         # sleep they are evened out, so the crackle texture carries rather than a few bangs).
-        a = a ** 0.5
+        a = a ** 0.4
         return self.pop_cap * np.tanh(a / self.pop_cap)
 
     def _pops(self, rng, times, sizes):

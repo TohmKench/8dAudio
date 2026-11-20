@@ -137,8 +137,9 @@ is mostly heard as its cracks and pops rather than as a rushing noise.
   What the ear hears as loudness (10 ms) stays within about 12 dB of the average.
 
 Balance per setting is `mix_db`: the bed by power (roar 0 dB, ember ticks about -11, hiss about -20) and
-`crackle`, the crackles' power over the whole bed (+1 dB; in loudness the crackles come out about 3 LU
-over the roar, because they sit where hearing is most sensitive).
+`crackle`, the crackles' power over the whole bed (-6 dB). Cracks are sparse (a calm fire, not constant
+crackling): about one a second stands clearly over the bed (median ~9 dB over it in 10 ms loudness),
+with smaller ones between; the bonfire is a little busier.
 
 Parameters: `environment`, `intensity` (0.5 gentle to 1.35 roaring), `wood` (`softwood` pops and hisses,
 `mixed`, `hardwood` is steadier and deeper), `dampness` (0 to 1), `variability`, `crest_db`. Fire sets

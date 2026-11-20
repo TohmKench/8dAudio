@@ -300,21 +300,28 @@ def test_fire_is_chunk_invariant_level_and_sleep_safe(env):
     assert 20 * np.log10(np.percentile(np.abs(a), 99.99) / rms(a)) > 10
 
 
-def test_fire_crackles_lead_a_quiet_bed():
-    """Heard as cracks and pops over a soft bed, not as static or wind: the crackles are
-    louder than the roar, and the ember ticks and hiss stay far down."""
+def test_fire_cracks_stand_clear_of_a_quiet_bed():
+    """Heard as a calm fire with clear cracks now and then, not as static, wind or constant
+    crackling: about one crack a second stands well clear of the bed, and the ember ticks
+    and hiss stay far down."""
     for env in ("campfire", "fireplace"):
         parts = {}
-        for keep in ("crackle", "roar", "fizz", "hiss", None):
+        for keep in ("crackle", "fizz", "hiss", None):
             s = FireScene(np.random.default_rng(2), environment=env, budget=600)
-            if keep:  # one part alone, unlimited (the limiter follows the whole fire's level)
+            if keep:  # one part alone
                 s.mute = {k for k in s.g if k != keep}
-                s.limiter.threshold = np.inf
-            parts[keep] = loudness_lufs(s(int(12 * SR)))
-        whole = parts.pop(None)
-        assert parts["crackle"] > parts["roar"] + 1.0
-        assert parts["crackle"] > whole - 4
-        assert parts["fizz"] < whole - 10 and parts["hiss"] < whole - 12
+            s.limiter.threshold = np.inf
+            parts[keep] = s(int(20 * SR))
+        whole = parts[None]
+        assert loudness_lufs(parts["fizz"]) < loudness_lufs(whole) - 8
+        assert loudness_lufs(parts["hiss"]) < loudness_lufs(whole) - 10
+        c, bed = parts["crackle"], whole - parts["crackle"]
+        ms = np.mean(c[: len(c) // 480 * 480] ** 2, axis=1).reshape(-1, 480).mean(axis=1)  # 10 ms
+        loud = ms > np.mean(bed ** 2) * 10 ** 0.6  # 6 dB over the bed
+        idx = np.flatnonzero(loud & ~np.r_[False, loud[:-1]])
+        cracks = idx[np.r_[True, np.diff(idx) > 5]]  # onsets 50 ms apart are separate cracks
+        assert 0.3 < len(cracks) / 20 < 2.0
+        assert np.median([ms[i:i + 3].max() for i in cracks]) > np.mean(bed ** 2) * 10 ** 0.75
 
 
 def test_wood_stove_survives_ticks_and_settling_together():
