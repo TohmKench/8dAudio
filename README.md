@@ -80,7 +80,10 @@ What is modelled:
   click of contact, plus whatever the surface does next. Water traps a small bubble that rings
   (Minnaert frequency) with a rising chirp; leaves and tiles give a short woody or stony ring.
   Metal sheets, window panes and tent fabric are split into panels, each with its own vibration modes,
-  and a drop excites each mode by how its shape moves at the landing point.
+  and a drop excites each mode by how its shape moves at the landing point. Because a sheet's modes are
+  fixed, each panel's response is worked out once per landing spot and drop size (heard from the
+  panel's centre, since a ringing sheet radiates from its whole surface), and each drop then adds a
+  scaled copy: many times faster than synthesising every mode for every drop.
 - **Space.** Every drop has a position in 3D. Its sound reaches each ear with the right delay, level,
   head shadow, distance loss and air absorption, and through a ceiling, wall or glass where there is
   one. All of it shares a small room or outdoor reverb. Listen on headphones.

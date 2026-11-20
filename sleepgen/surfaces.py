@@ -72,6 +72,8 @@ def rings(rng, d, v, k, f_lo, f_hi, q_lo, q_hi, gain, cap=None):
 
 SHORT_L = 256  # samples rendered for the contact clicks (they are gone within ~5 ms)
 FLOOR_DB = 40.0  # every mode is at least this far down by the end of its window
+SPOTS = 6  # plates: landing spots per panel side for the precomputed responses
+SIZE_BINS = np.array([0.4, 0.8, 1.4, 2.4, 4.0])  # plates: drop-size classes (mm)
 
 
 class Surface:
@@ -168,7 +170,7 @@ PLATE_MATERIALS = {
                   n_modes=48, m=12, gain=0.55, clicks=(3, 2000, 14000, 0.04e-3, 0.15e-3, 0.6),
                   boom=(2, 45, 110, 4, 8, 0.35), panel=(0.9, 2.4), L=7680),
     "glass": dict(membrane=False, f11=(14, 24), band=(250, 4500), q=(12, 35), cap=0.006,
-                  n_modes=90, m=12, gain=0.08, clicks=(5, 2500, 14000, 0.04e-3, 0.2e-3, 0.6),
+                  n_modes=90, m=12, gain=0.065, clicks=(5, 2500, 14000, 0.04e-3, 0.2e-3, 0.6),
                   boom=None, panel=(1.0, 1.25), L=2880),
     # Fabric: a light nylon fly sheet. A bright tap (it is thin and light, so the contact
     # is short) over a soft drum-like tone from the taut sheet.
@@ -230,6 +232,67 @@ class Plate(Surface):
             j = len(p["f"])
             self.pf[i, :j], self.pm[i, :j], self.pn[i, :j], self.pq[i, :j] = p["f"], p["m"], p["n"], p["q"]
             self.valid[i, :j] = True
+        # The sheet's own low "boom" (the sheet on its purlins/frame), fixed per panel.
+        self.boom_f = self.boom_q = None
+        if spec["boom"]:
+            k, lo, hi, qlo, qhi, g = spec["boom"]
+            self.boom_f = _loguni(rng, lo, hi, (self.n_panels, k))
+            self.boom_q = rng.uniform(qlo, qhi, (self.n_panels, k))
+            self.boom_sign = rng.choice([-1.0, 1.0], (self.n_panels, k))
+            self.boom_gain = g
+
+    # -- bank rendering: every (panel, landing spot, drop size) has a fixed response ----
+    def locate(self, uv):
+        """Panel and landing-spot index (SPOTS x SPOTS grid per panel) for each drop."""
+        u = np.clip(uv[:, 0], 0, 0.9999) * self.nu
+        w = np.clip(uv[:, 1], 0, 0.9999) * self.nv
+        iu, iv = u.astype(int), w.astype(int)
+        su, sv = ((u - iu) * SPOTS).astype(int), ((w - iv) * SPOTS).astype(int)
+        return iu * self.nv + iv, su * SPOTS + sv
+
+    def click_modes(self, rng, d, v):
+        """Just the contact click, rendered per drop (the sheet's ring comes from the bank)."""
+        m = clicks(rng, d, v, *self.spec["clicks"])
+        m.tau = np.minimum(m.tau, SHORT_L / (FLOOR_DB / 8.686 * P.SR))
+        return m
+
+    def bank_modes(self, v_bins, rng):
+        """Modes of every panel for a drop of unit impact strength landing at the centre of
+        each spot, for each drop-size class. Returns f, tau, amp shaped (panels, spots,
+        sizes, modes) and the attack per size."""
+        spec = self.spec
+        Pn, S, B = self.n_panels, SPOTS * SPOTS, len(SIZE_BINS)
+        cell = np.repeat(np.arange(SPOTS), SPOTS), np.tile(np.arange(SPOTS), SPOTS)
+        m = min(spec["m"], self.k)
+        kb = 0 if self.boom_f is None else self.boom_f.shape[1]
+        F = np.zeros((Pn, S, B, m + kb))
+        TAU, AMP = np.ones_like(F), np.zeros_like(F)
+        for p in range(Pn):
+            # A point somewhere inside each spot's cell (not its exact centre: a regular grid
+            # would sample the high-order mode shapes at the same few values every time).
+            su = (cell[0] + rng.uniform(0.1, 0.9, S)) / SPOTS
+            sv = (cell[1] + rng.uniform(0.1, 0.9, S)) / SPOTS
+            shape = np.sin(self.pm[p] * np.pi * su[:, None]) * np.sin(self.pn[p] * np.pi * sv[:, None])  # (S,k)
+            for b, (d, v) in enumerate(zip(SIZE_BINS, v_bins)):
+                w = P.force_weight(self.pf[p][None], np.array([d]), np.array([v]))[0]  # (k,)
+                # Same choice as the per-drop path: the strongest modes, with some chance.
+                score = np.abs(shape) * w * self.valid[p] * rng.uniform(0.6, 1.4, shape.shape)
+                top = np.argsort(-score, axis=1)[:, :m]
+                rows = np.arange(S)[:, None]
+                f_sel = self.pf[p][top]
+                F[p, :, b, :m] = f_sel
+                TAU[p, :, b, :m] = _q_tau(f_sel, self.pq[p][top], spec["cap"])
+                AMP[p, :, b, :m] = (shape * w)[rows, top] * self.valid[p][top] * spec["gain"] / np.sqrt(m) * 2.0
+                if kb:
+                    fb = self.boom_f[p]
+                    wb = P.force_weight(fb[None], np.array([d]), np.array([v]))[0]
+                    F[p, :, b, m:] = fb
+                    TAU[p, :, b, m:] = self.boom_q[p] / (np.pi * fb)
+                    AMP[p, :, b, m:] = (self.boom_sign[p] * self.boom_gain * wb / np.sqrt(kb))[None] * \
+                        (np.sin(np.pi * su) * np.sin(np.pi * sv))[:, None] * 2.2
+        TAU = np.minimum(TAU, self.L / (FLOOR_DB / 8.686 * P.SR))
+        attack = _attack(SIZE_BINS, np.asarray(v_bins))
+        return F, TAU, AMP, attack
 
     def modes(self, rng, d, v, uv):
         spec = self.spec
@@ -255,6 +318,11 @@ class Plate(Surface):
         if spec["boom"]:
             parts.append(rings(rng, d, v, *spec["boom"]))
         return Modes.stack(parts)
+
+
+def size_bin(d):
+    """Nearest plate drop-size class for each diameter."""
+    return np.abs(np.log(np.asarray(d))[:, None] - np.log(SIZE_BINS)[None]).argmin(axis=1)
 
 
 def make_surface(kind: str, rng, size=(1.0, 1.0)) -> Surface:

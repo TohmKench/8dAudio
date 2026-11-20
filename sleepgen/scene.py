@@ -30,7 +30,7 @@ from . import gpu
 from . import rainphys as P
 from .dsp import SR, Reverb, rms
 from .layers import Layer, child
-from .surfaces import SHORT_L, Modes, make_surface
+from .surfaces import SHORT_L, SIZE_BINS, SPOTS, Modes, Plate, make_surface, size_bin
 
 CTRL = SR // 10  # rain-rate / wind resolution: 0.1 s
 UNIT = SR        # drops are generated in fixed 1 s units, so output never depends on chunk size
@@ -88,6 +88,93 @@ def _render(buf, start, delays, amps, modes: Modes, L: int):
             y = torch.einsum("bm,bml->bl", T(amps[ear][e]), g) * env
             idx = (base + torch.as_tensor(d_int[ear][e], device=dev))[:, None] + nl[None, :]
             buf[ear].index_add_(0, idx.reshape(-1), y.reshape(-1))
+
+
+class PlateBank:
+    """Precomputed responses of a panelled sheet (metal roofing, glass, tent fabric).
+
+    A sheet's vibration modes are fixed, so instead of synthesising every mode for every
+    drop, each (panel, landing spot, drop-size class) gets its response computed once:
+    the panel's modes as excited at that spot, heard from the panel's centre (a ringing
+    sheet radiates from its whole surface, not from the point that was hit) with the
+    right delay, head shadow, distance and air loss at each ear. A drop then costs one
+    scaled copy of its response, which is many times faster than synthesising it.
+    """
+
+    def __init__(self, patch, surf: Plate, dev, rng):
+        torch = gpu._torch()
+        s, c = np.asarray(patch.size, float), np.asarray(patch.center, float)
+        axes = np.argsort(-s)[:2]
+        centres = []
+        for p in range(surf.n_panels):
+            iu, iv = divmod(p, surf.nv)
+            uvw = np.full(3, 0.5)
+            uvw[axes[0]], uvw[axes[1]] = (iu + 0.5) / surf.nu, (iv + 0.5) / surf.nv
+            centres.append(c + (uvw - 0.5) * s)
+        v_bins = P.fall_velocity(SIZE_BINS, patch.fall_height)
+        f, tau, amp, attack = surf.bank_modes(v_bins, rng)  # (Pn, S, B, M)
+        r, dl, dr, th_l, th_r = P.ear_geometry(np.array(centres))
+        ex = (slice(None), None, None, None)
+        common = amp * P.air_absorption(f, r[ex]) / r[ex] * patch.path_gain(f)
+        amps = np.stack([common * P.head_shadow(f, th_l[ex]), common * P.head_shadow(f, th_r[ex])])
+        delays = np.round(np.stack([dl, dr])).astype(int)  # (2, Pn)
+        Pn, S, B, M = f.shape
+        L = surf.L
+        self.L = L + int(delays.max()) + 1
+        self.n_spots, self.n_sizes = S, B
+        n = torch.arange(L, device=dev, dtype=torch.float32)
+        taper = torch.clamp((L - n) / (0.12 * L), max=1.0)
+        kern = torch.zeros(Pn * S * B, 2, self.L, device=dev)
+        rows = Pn * S * B
+        fl, tl = f.reshape(rows, M), tau.reshape(rows, M)
+        # Each response starts its modes at their own phase (as the per-drop path does), so
+        # the onset has the same bite.
+        phl = rng.uniform(0, 2 * np.pi, (rows, M))
+        al = amps.reshape(2, rows, M)
+        att = np.broadcast_to(attack[None, None, :], (Pn, S, B)).reshape(rows)
+        panel = np.repeat(np.arange(Pn), S * B)
+        bs = max(1, gpu.batch_elements() // (M * L))
+
+        def T(a):
+            return torch.as_tensor(np.ascontiguousarray(a), device=dev, dtype=torch.float32)
+
+        x = n / SR
+        for a in range(0, rows, bs):
+            e = slice(a, a + bs)
+            g = torch.exp(-x / T(tl[e])[:, :, None]) * torch.sin(2 * np.pi * T(fl[e])[:, :, None] * x
+                                                                 + T(phl[e])[:, :, None])
+            env = (1 - torch.exp(-x[None] / T(att[e])[:, None])) * taper
+            for ear in (0, 1):
+                y = torch.einsum("bm,bml->bl", T(al[ear][e]), g) * env
+                for p in np.unique(panel[e]):
+                    sel = np.flatnonzero(panel[e] == p)
+                    off = int(delays[ear, p])
+                    kern[a + sel, ear, off:off + L] = y[torch.as_tensor(sel, device=dev)]
+        self.kern = kern
+
+    def index(self, panel, spot, size):
+        return (panel * self.n_spots + spot) * self.n_sizes + size
+
+
+def render_bank(buf, start, kidx, gains, bank: PlateBank):
+    """Add one scaled copy of each drop's precomputed response into `buf` (2, N)."""
+    torch = gpu._torch()
+    E = len(kidx)
+    if E == 0:
+        return
+    dev = buf.device
+    L = bank.L
+    nl = torch.arange(L, device=dev)
+    i0 = torch.as_tensor(np.round(start).astype(np.int64), device=dev)
+    bs = max(1, gpu.batch_elements() // (4 * L))
+    k_all = torch.as_tensor(kidx, device=dev)
+    g_all = torch.as_tensor(gains, device=dev, dtype=torch.float32)
+    for s in range(0, E, bs):
+        e = slice(s, s + bs)
+        y = bank.kern[k_all[e]] * g_all[e][:, None, None]  # (b, 2, L)
+        idx = (i0[e][:, None] + nl[None, :]).reshape(-1)
+        for ear in (0, 1):
+            buf[ear].index_add_(0, idx, y[:, ear].reshape(-1))
 
 
 # ------------------------------------------------------------------------------ patches
@@ -333,7 +420,11 @@ class RainScene(Layer):
         weights = sum(p.weight for p in self.patches if p.individual and p.fixed_rate is None)
         self.share = [p.weight / weights * self.budget if (p.individual and p.fixed_rate is None) else 0.0
                       for p in self.patches]
-        self.Lmax = max(s.L for s in self.surfaces)
+        # Panelled sheets ring from a precomputed bank; only their contact clicks are per drop.
+        bank_rng = child(rng)
+        self.banks = [PlateBank(p, s, self.dev, bank_rng) if isinstance(s, Plate) and p.individual else None
+                      for p, s in zip(self.patches, self.surfaces)]
+        self.Lmax = max([s.L for s in self.surfaces] + [b.L for b in self.banks if b is not None])
         self.room = None
         if env.get("room"):
             r = env["room"]
@@ -341,6 +432,7 @@ class RainScene(Layer):
             self.room_wet = r["wet"]
 
         self.pending = [[] for _ in self.patches]
+        self.bank_pending = [[] for _ in self.patches]
         self.gen_until = 0  # samples generated so far (multiple of UNIT)
         self.ctrl_rate = np.zeros(0)
         self.ctrl_start = 0  # control-block index of ctrl_rate[0]
@@ -394,12 +486,29 @@ class RainScene(Layer):
 
     def _voice(self, rng, i, d, v, pos, uv):
         """Modes and per-ear amplitudes/delays for drops on patch i."""
-        p = self.patches[i]
         m = self.surfaces[i].voice(rng, d, v, uv)
+        delays, amps = self._spatial(i, m, pos)
+        return m, delays, amps
+
+    def _spatial(self, i, m, pos):
+        p = self.patches[i]
         r, dl, dr, th_l, th_r = P.ear_geometry(pos)
         common = m.amp * P.air_absorption(m.f, r[:, None]) / r[:, None] * p.path_gain(m.f)
         amps = np.stack([common * P.head_shadow(m.f, th_l[:, None]), common * P.head_shadow(m.f, th_r[:, None])])
-        return m, np.stack([dl, dr]), amps
+        return np.stack([dl, dr]), amps
+
+    def _take_bank(self, i, end):
+        keep, out = [], []
+        for t, k, g in self.bank_pending[i]:
+            sel = t < end
+            if sel.any():
+                out.append((t[sel], k[sel], g[sel]))
+            if not sel.all():
+                keep.append((t[~sel], k[~sel], g[~sel]))
+        self.bank_pending[i] = keep
+        if not out:
+            return None
+        return tuple(np.concatenate([o[j] for o in out]) for j in range(3))
 
     # -- generation in fixed 1 s units ------------------------------------------------
     def _generate_unit(self):
@@ -429,8 +538,18 @@ class RainScene(Layer):
                 ds.append(d), vs.append(v), poss.append(pos), uvs.append(uv)
             if times:
                 d, v, pos, uv = (np.concatenate(a) for a in (ds, vs, poss, uvs))
-                m, delays, amps = self._voice(rng, i, d, v, pos, uv)
-                self.pending[i].append((np.concatenate(times), m, delays, amps))
+                t = np.concatenate(times)
+                if self.banks[i] is not None:
+                    surf = self.surfaces[i]
+                    m = surf.click_modes(rng, d, v)
+                    delays, amps = self._spatial(i, m, pos)
+                    self.pending[i].append((t, m, delays, amps))
+                    panel, spot = surf.locate(uv)
+                    kidx = self.banks[i].index(panel, spot, size_bin(d))
+                    self.bank_pending[i].append((t, kidx, P.impact_strength(d, v)))
+                else:
+                    m, delays, amps = self._voice(rng, i, d, v, pos, uv)
+                    self.pending[i].append((t, m, delays, amps))
         self.gen_until += UNIT
 
     def _take(self, i, end):
@@ -506,7 +625,13 @@ class RainScene(Layer):
             if got is None:
                 continue
             t, m, delays, amps = got
-            render_events(buf, t - start, delays, amps, m, self.surfaces[i].L)
+            L = SHORT_L if self.banks[i] is not None else self.surfaces[i].L
+            render_events(buf, t - start, delays, amps, m, L)
+            if self.banks[i] is not None:
+                got = self._take_bank(i, end)
+                if got is not None:
+                    t, k, g = got
+                    render_bank(buf, t - start, k, g, self.banks[i])
         self.tail = buf[:, n:].clone()
         out = buf[:, :n].T.cpu().numpy().astype(np.float64)
 
