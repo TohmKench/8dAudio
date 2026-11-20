@@ -30,7 +30,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from scipy import fft as sp_fft
 from scipy import signal
 
 from . import gpu
@@ -119,7 +118,7 @@ class FilterBank:
         R, Lw = waves.shape
         self.R = R
         dmax = 0 if delays is None else int(np.max(delays))
-        self.nfft = sp_fft.next_fast_len(max(8192, 6 * (Lw + dmax)), real=True)
+        self.nfft = gpu.fft_len(max(8192, 6 * (Lw + dmax)))
         self.Nb = self.nfft - Lw - dmax  # impulse positions covered per block
         self.W = torch.fft.rfft(waves, n=self.nfft, dim=1)  # (R, F)
         if gains is None:
@@ -152,7 +151,7 @@ class FilterBank:
         blk = pos // Nb
         flat = (np.arange(C)[:, None] * R + member[None]) * nfft + (pos - blk * Nb)
         blk, flat, a = blk.ravel(), flat.ravel(), amp.ravel()
-        order = np.argsort(blk, kind="stable")
+        order = np.argsort(blk.astype(np.int16), kind="stable")  # small ints: a fast radix sort
         blk, flat, a = blk[order], flat[order], a[order]
         bounds = np.searchsorted(blk, np.arange(blk[-1] + 2))
         flat_t = gpu.upload(flat)
@@ -270,7 +269,7 @@ class DropPool:
             L = SHORT_L if short else surf.L
             # Estimated cost per second of audio, each way.
             n_fft = sum(surf.parts[i].members for i in ids)
-            nfft = sp_fft.next_fast_len(max(8192, 6 * L), real=True)
+            nfft = gpu.fft_len(max(8192, 6 * L))
             fft_cost = 2 * n_fft * SR * nfft / (nfft - L) / gpu.fft_rate()
             direct_cost = drops_per_s * 2 * L / gpu.scatter_rate()
             use_fft = fft_cost < direct_cost

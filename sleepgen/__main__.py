@@ -124,6 +124,7 @@ def main(argv=None) -> int:
                 t = time.time()
                 s = FireScene(np.random.default_rng(1), environment=env) if fire else \
                     RainScene(np.random.default_rng(1), environment=env, rain_mm_h=6.0)
+                s(SR * 10)  # warm up (first-use GPU set-up is a one-off per render, not per hour)
                 t_init = time.time() - t
                 t = time.time()
                 for _ in range(int(args.seconds // 10)):

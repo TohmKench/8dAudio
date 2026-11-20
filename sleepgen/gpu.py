@@ -109,3 +109,13 @@ def upload(a, dtype=None):
     if dtype is not None:
         t = t.to(dtype)
     return t.to(device())
+
+
+def fft_len(n: int) -> int:
+    """FFT length to use for at least n samples. On a GPU, a power of two: AMD's FFT library
+    compiles kernels for other lengths at run time (seconds for each new length), while
+    powers of two are prebuilt. On a CPU, scipy's fastest length."""
+    if is_gpu():
+        return 1 << max(0, int(n - 1).bit_length())
+    from scipy import fft as sp_fft
+    return sp_fft.next_fast_len(int(n), real=True)

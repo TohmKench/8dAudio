@@ -170,7 +170,8 @@ class Convolver:
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
         n = len(x)
-        size = sp_fft.next_fast_len(n + self.taps - 1, real=True)
+        size = sp_fft.next_fast_len(n + self.taps - 1, real=True) if self._gpu is None else \
+            self._gpu.fft_len(n + self.taps - 1)
         h = self.h if self.h.ndim == 2 else self.h[:, None]
         if self._gpu is None:
             if size not in self._spec:
