@@ -6,6 +6,9 @@
   python -m sleepgen random -o out/video.m4a --hours 10 [--theme ocean] [--library sounds/]
   python -m sleepgen random --theme rain --secondary wind --accent crickets -o out/v.m4a
   python -m sleepgen previews -d previews --seconds 90
+  python -m sleepgen previews --rain --rate 4 -d previews      (rain in every environment)
+  python -m sleepgen previews --fire -d previews               (fire in every setting)
+  python -m sleepgen bench                                     (GPU speed check)
 """
 
 from __future__ import annotations
@@ -71,6 +74,8 @@ def main(argv=None) -> int:
     pv.add_argument("--library")
     pv.add_argument("--rain", action="store_true", help="one clip of rain in every environment instead")
     pv.add_argument("--rate", type=float, help="with --rain: rainfall in mm/h (default: random per seed)")
+    pv.add_argument("--fire", action="store_true", help="one clip of fire in every setting instead")
+    pv.add_argument("--intensity", type=float, help="with --fire: 0.5 gentle .. 1.3 roaring (default: random)")
 
     bn = sub.add_parser("bench", help="time rain rendering on this machine and project a 10 hour render")
     bn.add_argument("--seconds", type=float, default=20)
@@ -163,6 +168,21 @@ def main(argv=None) -> int:
             out = os.path.join(args.dir, f"rain-{env}.mp3")
             report = render_with_sidecar(recipe, out, args.seconds, bitrate="256k", progress=False)
             print(f"{env:9s} {report['render_seconds']:6.1f}s  -> {out}")
+        return 0
+
+    if args.cmd == "previews" and args.fire:
+        from .fire import FIRE_ENVIRONMENTS
+        os.makedirs(args.dir, exist_ok=True)
+        for env in FIRE_ENVIRONMENTS:
+            recipe = random_recipe(args.seed, "fire", args.library, secondaries=[], accents=[])
+            recipe["layers"][0]["params"]["environment"] = env
+            if args.intensity:
+                recipe["layers"][0]["params"]["intensity"] = args.intensity
+            recipe["meta"]["headline"] = FIRE_ENVIRONMENTS[env]["title"]
+            recipe["master"].update(fade_in_s=3, fade_out_s=3)
+            out = os.path.join(args.dir, f"fire-{env}.mp3")
+            report = render_with_sidecar(recipe, out, args.seconds, bitrate="256k", progress=False)
+            print(f"{env:10s} {report['render_seconds']:6.1f}s  peak {report['peak_dbfs']} dBFS  -> {out}")
         return 0
 
     if args.cmd == "previews":

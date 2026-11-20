@@ -474,8 +474,15 @@ def _rainscene(rng, **params):
     return RainScene(rng, **params)
 
 
+def _firescene(rng, **params):
+    from .fire import FireScene
+
+    return FireScene(rng, **params)
+
+
 LAYER_TYPES = {
     "rainscene": _rainscene,
+    "firescene": _firescene,
     "noise": NoiseLayer,
     "rain": Rain,
     "thunder": Thunder,

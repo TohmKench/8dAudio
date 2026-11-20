@@ -79,6 +79,8 @@ def base_rain(rng, ctx, environment=None):
     rate = _r(rng, *RAIN_RATES[word], 1)
     ctx["rain_intensity"] = min(1.0, rate / 8.0)
     ctx["environment"] = environment
+    if environment in ("lake", "forest", "tent"):
+        ctx["exclude"].add("fire")  # a fireside only makes sense indoors
     ctx["features"].append("3D Audio")
     layer = {"type": "rainscene", "level_db": 0.0,
              "params": {"environment": environment, "rain_mm_h": rate, "variability": _r(rng, 0.2, 0.4)},
@@ -130,8 +132,37 @@ def base_stream(rng, ctx):
     return [_sample(rng, ctx, ["stream"])], "Gentle Stream"
 
 
-def base_fireplace(rng, ctx):
-    return [_sample(rng, ctx, ["fire"])], "Crackling Fireplace"
+# Where the fire is, how often each setting is picked, and how lively it is.
+FIRE_SETTINGS = {"fireplace": 1.2, "campfire": 1.0, "wood_stove": 0.8, "bonfire": 0.6}
+FIRE_INTENSITY = {"Gentle": (0.5, 0.7), "": (0.7, 1.05), "Roaring": (1.05, 1.35)}
+
+
+def base_fire(rng, ctx, environment=None):
+    """A physically modelled wood fire in a setting (fire.py)."""
+    from .fire import FIRE_ENVIRONMENTS
+
+    if environment is None:
+        names = sorted(FIRE_SETTINGS)
+        w = np.array([FIRE_SETTINGS[n] for n in names])
+        environment = str(rng.choice(names, p=w / w.sum()))
+    spec = FIRE_ENVIRONMENTS[environment]
+    word = str(rng.choice(list(FIRE_INTENSITY), p=[0.3, 0.5, 0.2]))
+    intensity = _r(rng, *FIRE_INTENSITY[word])
+    ctx["environment"] = environment
+    ctx["features"].append("3D Audio")
+    if spec["outdoor"]:
+        ctx["exclude"].add("light_rain")  # nobody sits by a campfire in the rain
+    else:
+        ctx["exclude"].update({"crickets", "owl", "frogs"})
+    layer = {"type": "firescene", "level_db": 0.0, "send": _r(rng, 0.0, 0.06),
+             "params": {"environment": environment, "intensity": intensity,
+                        "wood": str(rng.choice(["softwood", "mixed", "hardwood"], p=[0.3, 0.4, 0.3])),
+                        "dampness": _r(rng, 0.0, 0.5), "variability": _r(rng, 0.15, 0.3)}}
+    layers = [layer]
+    if library_files(ctx["library"], ["fire"]) and rng.random() < 0.4:
+        layers.append(_sample(rng, ctx, ["fire"], _r(rng, -12, -6, 1)))
+    title = f"{word} {spec['name']}" if word else spec["title"]
+    return layers, title
 
 
 # ---------------------------------------------------------------------- secondaries
@@ -175,7 +206,13 @@ def sec_light_rain(rng, ctx, level):
 
 
 def sec_fire(rng, ctx, level):
-    return _sample(rng, ctx, ["fire"], level), "Crackling Fire"
+    """A fire in the room while it rains outside."""
+    if library_files(ctx["library"], ["fire"]) and rng.random() < 0.3:
+        return _sample(rng, ctx, ["fire"], level), "Crackling Fire"
+    return {"type": "firescene", "level_db": level,
+            "params": {"environment": str(rng.choice(["fireplace", "wood_stove"])),
+                       "intensity": _r(rng, 0.55, 0.9), "wood": str(rng.choice(["mixed", "hardwood"])),
+                       "dampness": _r(rng, 0.0, 0.2), "variability": 0.2}}, "Crackling Fire"
 
 
 def sec_stream(rng, ctx, level):
@@ -226,8 +263,8 @@ BASES = {
     "drone": dict(build=base_drone, secondaries=["noise_bed", "light_rain", "wind", "stream"], accents=["chimes"]),
     "stream": dict(build=base_stream, secondaries=["wind", "noise_bed", "light_rain"],
                    accents=["crickets", "frogs", "owl"], needs=["stream"]),
-    "fireplace": dict(build=base_fireplace, secondaries=["light_rain", "wind"],
-                      accents=["crickets", "owl"], needs=["fire"]),
+    "fire": dict(build=base_fire, secondaries=["light_rain", "wind", "noise_bed", "binaural"],
+                 accents=["crickets", "owl"]),
 }
 
 SECONDARIES = {
@@ -236,7 +273,7 @@ SECONDARIES = {
     "binaural": dict(build=sec_binaural),
     "drone": dict(build=sec_drone),
     "light_rain": dict(build=sec_light_rain),
-    "fire": dict(build=sec_fire, needs=["fire"]),
+    "fire": dict(build=sec_fire),
     "stream": dict(build=sec_stream, needs=["stream"]),
 }
 
@@ -294,14 +331,14 @@ def random_recipe(seed: int | None = None, theme: str | None = None, library: st
     if theme not in bases:
         raise ValueError(f"base {theme!r} needs library recordings in: {', '.join(BASES[theme]['needs'])}")
     spec = BASES[theme]
-    ctx = {"library": library, "sources": [], "features": []}
+    ctx = {"library": library, "sources": [], "features": [], "exclude": set()}
 
     layers, base_label = spec["build"](rng, ctx)
     for l in layers:  # the base is close and mostly direct, with a touch of the room
         l.setdefault("send", _r(rng, 0.12, 0.25))
 
     # Secondaries
-    pool = _available(SECONDARIES, spec["secondaries"], library)
+    pool = [s for s in _available(SECONDARIES, spec["secondaries"], library) if s not in ctx["exclude"]]
     if secondaries is None:
         k = min(len(pool), int(rng.choice([0, 1, 2], p=[0.3, 0.5, 0.2])))
         secondaries = [str(s) for s in rng.choice(pool, size=k, replace=False)] if k else []
@@ -314,7 +351,7 @@ def random_recipe(seed: int | None = None, theme: str | None = None, library: st
         sec_labels.append(label)
 
     # Accents: thunder only suits proper rain.
-    pool = _available(ACCENTS, spec["accents"], library)
+    pool = [a for a in _available(ACCENTS, spec["accents"], library) if a not in ctx["exclude"]]
     if ctx.get("rain_intensity", 1.0) < 0.5:
         pool = [a for a in pool if a != "thunder"]
     if accents is None:
@@ -349,7 +386,7 @@ def random_recipe(seed: int | None = None, theme: str | None = None, library: st
     if ctx["sources"]:
         meta["sources"] = ctx["sources"]
     # Physically modelled rain carries real high-frequency detail; don't dull it much.
-    lp = (13000, 16000) if theme == "rain" else (7000, 12000)
+    lp = (13000, 16000) if theme in ("rain", "fire") else (7000, 12000)
     master = {"lowpass_hz": int(rng.uniform(*lp)), "fade_in_s": 20, "fade_out_s": 45,
               "reverb": {"rt60": _r(rng, 1.6, 3.2), "predelay_ms": _r(rng, 15, 40, 0),
                          "damping": _r(rng, 0.4, 0.8), "level": 1.0}}

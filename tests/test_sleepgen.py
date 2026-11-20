@@ -218,8 +218,9 @@ def test_rain_scene_is_chunk_invariant_and_level(env):
 
 
 def test_rain_scene_is_deterministic():
+    # GPU sums aren't bit-identical run to run (summing order), hence the small tolerance.
     np.testing.assert_allclose(_scene_out("window", 1.0, 2.0, seed=9), _scene_out("window", 1.0, 2.0, seed=9),
-                               atol=1e-6)
+                               atol=1e-4)
     assert not np.allclose(_scene_out("window", 1.0, 2.0, seed=9), _scene_out("window", 1.0, 2.0, seed=10))
 
 
@@ -262,3 +263,54 @@ def test_rain_physics_basics():
     # A drip from a 2 m branch is slower than terminal velocity.
     assert P.fall_velocity(np.array([4.0]), 2.0)[0] < P.terminal_velocity(np.array([4.0]))[0]
     assert P.minnaert_hz(1.0) == pytest.approx(3260, rel=0.01)  # 1 mm bubble radius
+
+
+# -- fire (physical) --------------------------------------------------------------------
+
+from sleepgen.fire import FIRE_ENVIRONMENTS, FireScene  # noqa: E402
+
+
+def _fire_out(env, chunk_s, seconds=4.0, seed=3, **kw):
+    s = FireScene(np.random.default_rng(seed), environment=env, budget=600, **kw)
+    n, chunk, out = int(seconds * SR), int(chunk_s * SR), []
+    while n > 0:
+        k = min(chunk, n)
+        out.append(s(k))
+        n -= k
+    return np.concatenate(out)
+
+
+@pytest.mark.parametrize("env", list(FIRE_ENVIRONMENTS))
+def test_fire_is_chunk_invariant_level_and_sleep_safe(env):
+    a = _fire_out(env, 1.0, 6.0)
+    b = _fire_out(env, 0.37, 6.0)
+    assert np.all(np.isfinite(a))
+    np.testing.assert_allclose(a, b, atol=2e-4)
+    assert 0.3 < rms(a) < 3.0
+    assert np.corrcoef(a[:, 0], a[:, 1])[0, 1] < 0.9
+    # No crackle may jump far out of the bed: peaks stay within ~22 dB of the average.
+    assert 20 * np.log10(np.abs(a).max() / rms(a)) < 22.5
+    # ...but they are there: strong crackles stand well clear of the bed.
+    assert 20 * np.log10(np.percentile(np.abs(a), 99.99) / rms(a)) > 10
+
+
+def test_fire_is_deterministic_and_woods_differ():
+    np.testing.assert_allclose(_fire_out("campfire", 1.0, 2.0, seed=4), _fire_out("campfire", 1.0, 2.0, seed=4),
+                               atol=1e-4)
+    soft = FireScene(np.random.default_rng(1), environment="campfire", wood="softwood", budget=600)
+    hard = FireScene(np.random.default_rng(1), environment="campfire", wood="hardwood", budget=600)
+    assert soft.crackle_rate > hard.crackle_rate
+
+
+def test_fire_recipes_fit_the_setting():
+    for seed in range(40):
+        r = random_recipe(seed, "fire")
+        env = r["layers"][0]["params"]["environment"]
+        assert r["layers"][0]["type"] == "firescene"
+        if FIRE_ENVIRONMENTS[env]["outdoor"]:
+            assert "light_rain" not in r["meta"]["secondaries"]
+        else:
+            assert not set(r["meta"]["accents"]) & {"crickets", "owl", "frogs"}
+        r = random_recipe(seed, "rain")
+        if r["layers"][0]["params"]["environment"] in ("lake", "forest", "tent"):
+            assert "fire" not in r["meta"]["secondaries"]

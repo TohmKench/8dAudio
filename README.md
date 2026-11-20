@@ -8,8 +8,8 @@ Every video gets a randomly generated recipe, so no two uploads are the same mix
 
 | Tier | How many | Level | Examples |
 |---|---|---|---|
-| **Base** | 1, always on | 0 dB | rain, ocean, brown/pink noise, fan, solfeggio drone, stream*, fireplace* |
-| **Secondary** | 0 to 2, always on | 6 to 14 dB under | wind, noise bed, binaural beats, drone, soft rain, fire*, stream* |
+| **Base** | 1, always on | 0 dB | rain, fire, ocean, brown/pink noise, fan, solfeggio drone, stream* |
+| **Secondary** | 0 to 2, always on | 6 to 14 dB under | wind, noise bed, binaural beats, drone, soft rain, fire, stream* |
 | **Accent** | 0 to 1, comes and goes | 8 to 14 dB under | crickets, distant thunder, owl*, frogs*, wind chimes* |
 
 \* needs recordings in the sound library.
@@ -28,6 +28,7 @@ with PyTorch and is meant to run on a GPU (see "Running on the GPU" below).
 python -m sleepgen themes                                  # list themes
 python -m sleepgen previews -d previews --seconds 90       # a short clip of every theme
 python -m sleepgen previews --rain -d previews             # rain in every environment
+python -m sleepgen previews --fire -d previews             # fire in every setting
 python -m sleepgen bench                                   # how fast this machine renders rain
 python -m sleepgen random -o out/video1.m4a --hours 10     # random theme, 10 hours
 python -m sleepgen random --theme rain --secondary wind --accent crickets -o out/v.m4a --hours 8
@@ -93,6 +94,35 @@ Recipe parameters: `environment`, `rain_mm_h` (light 1 to 2.5, moderate 2.5 to 7
 `variability`, `bed_db`, `diffuse_db`. The code is in `sleepgen/scene.py` (environments and rendering),
 `sleepgen/surfaces.py` (what a drop sounds like on each surface) and `sleepgen/rainphys.py` (the physics).
 
+## Fire: physical, crackle by crackle
+
+`firescene` builds a wood fire from what a fire physically does, in four settings:
+
+| Setting | What you hear |
+|---|---|
+| `campfire` | Lying a couple of metres from a campfire on open ground |
+| `fireplace` | An open fireplace across a living room: brick hearth, chimney draw, soft room |
+| `wood_stove` | A cast iron stove with a glass door: muffled crackles, a steady draw, ticking iron |
+| `bonfire` | A big bonfire a few metres off: deep, slow roar and busy crackling |
+
+- **Flame roar.** Turbulent combustion as a soft, low rush. Flames "puff" at a rate set by the fire's
+  size (about 1.5 / sqrt(diameter) Hz), so a bonfire breathes slowly and a stove quickly, with random
+  flicker on top.
+- **Crackles.** Each crack of drying wood or burst of sap is an event placed in 3D inside the fire bed:
+  a rough burst of micro-fractures over a few milliseconds, often with a short woody ring. They come in
+  clusters, with a heavy-tailed spread of sizes and busy and quiet spells.
+- **Ember fizz.** Thousands of tiny ticks a second, rendered one by one (the GPU budget sets how many).
+- **Steam hiss.** A breathy hiss that grows with damp wood, and now and then a soft, gliding "singing" jet.
+- **Settling logs.** Every few minutes, a soft cluster of ticks and a low knock, and the fire flares up a
+  little for a while afterwards.
+- **Sleep safety.** A strong crackle peaks about 12 dB above the fire's average level, and none can
+  peak more than 19 dB above it (`crest_db`).
+
+Parameters: `environment`, `intensity` (0.5 gentle to 1.35 roaring), `wood` (`softwood` pops and hisses,
+`mixed`, `hardwood` is steadier and deeper), `dampness` (0 to 1), `variability`, `crest_db`. Fire sets
+its own exclusions in recipes: no rain around a campfire, no crickets indoors. Under rain on a roof or
+window, fire can also be a secondary ("Rain on the Window with Crackling Fire").
+
 ## Running on the GPU
 
 `--device` picks where synthesis runs: `auto` (default) tries a CUDA-style GPU, then DirectML, then
@@ -118,7 +148,7 @@ recordings into matching themes:
 
 ```
 sounds/
-  rain/  rain_roof/  rain_window/  ocean/  stream/  fire/  wind/      (bases and secondaries)
+  rain/  rain_roof/  rain_window/  ocean/  stream/  fire/  wind/      (blended into bases and secondaries)
   crickets/  owl/  frogs/  chimes/                                   (accents)
 ```
 
@@ -145,7 +175,7 @@ at least 30 seconds long and free of voices, cars, birds and other sharp sounds.
 }
 ```
 
-Layer types: `rainscene`, `noise`, `rain` (older, simpler rain), `thunder`, `ocean`, `fan`, `wind`, `crickets`, `binaural`, `drone`, `sample`.
+Layer types: `rainscene`, `firescene`, `noise`, `rain` (older, simpler rain), `thunder`, `ocean`, `fan`, `wind`, `crickets`, `binaural`, `drone`, `sample`.
 `send` (0 to 1) feeds the shared reverb and `dry` (0 to 1) lowers the direct sound to push a layer
 further away. `gate` makes any layer come and go (`on_s` / `off_s` ranges) and stop for good at `until_s`.
 See `sleepgen/layers.py` for each one's parameters.
