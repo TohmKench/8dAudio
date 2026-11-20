@@ -7,18 +7,23 @@ A burning fire makes five kinds of sound, and each is modelled separately:
                pool-fire puffing law), so a bonfire breathes slowly and a stove quickly,
                and they flicker at random on top of that.
   Crackles     Pockets of sap and water flash to steam and burst, and drying wood
-               cracks. Each crackle is an individual event: a very short broadband
-               click, sometimes with a brief woody ring from the fragment, placed in 3D
-               inside the fire bed. They come in clusters (one fracture sets off a few
-               more within milliseconds), their sizes follow a heavy-tailed law (many
-               tiny ticks, a few bigger pops), and busy and quiet spells come and go.
-               The biggest pops are softly capped so nothing jolts a sleeper awake.
-  Ember fizz   Thousands of tiny ticks a second from embers and charring surfaces,
-               rendered one by one (the GPU budget sets how many), following the flames.
-  Steam hiss   Escaping gas and steam: a breathy band-limited hiss, stronger for damp
-               wood, with the odd soft "singing" jet that glides in pitch and fades.
+               cracks. Each crackle is an individual event placed in 3D inside the fire
+               bed: a sharp snap with a brief woody ring from the split wood, then a
+               short sputter of smaller fractures that dies away. They come in clusters
+               (one crack sets off a few more within milliseconds), their sizes follow a
+               heavy-tailed law (gently evened out for sleep), and busy and quiet spells
+               come and go.
+  Ember ticks  A light sprinkle of tiny ticks from embers and charring surfaces, each
+               one distinct, following the flames.
+  Steam hiss   Escaping gas and steam: a faint breathy hiss, stronger for damp wood, with
+               the odd soft "singing" jet that glides in pitch and fades.
   Settling     Every few minutes the burnt logs shift: a soft cluster of ticks and a low
                thump, and the fire flares up a little afterwards.
+
+The crackles lead. The roar, ticks and hiss form a soft, quiet bed under them (a real
+fire close by is mostly heard as its cracks and pops, not as a rushing noise). A gentle
+look-ahead limiter keeps every peak within `crest_db` of the fire's recent level, so the
+pops stay clear but never jolt a sleeper awake.
 
 Fire size and intensity wander slowly over the night, so it burns brighter and lower
 in long, natural spells. Wood type and dampness change the balance (pine pops and
@@ -35,7 +40,7 @@ from scipy import signal
 
 from . import gpu
 from . import rainphys as P
-from .dsp import SR, Reverb
+from .dsp import SR, PeakLimiter, Reverb
 from .layers import Layer, child
 from .scene import _FIR, _sub, render_events
 from .surfaces import SHORT_L, Modes
@@ -49,9 +54,9 @@ NC = UNIT // CTRL
 WOODS = {
     # crackle rate (per s at full intensity), cluster size, size-law exponent (lower = more
     # big pops), brightness, sap whistles per minute at full dampness
-    "softwood": dict(rate=(5.0, 9.0), cascade=2.0, alpha=2.1, bright=1.12, whistle=0.8, hiss=1.0),
-    "mixed": dict(rate=(2.8, 5.5), cascade=1.5, alpha=2.3, bright=1.0, whistle=0.4, hiss=0.8),
-    "hardwood": dict(rate=(1.4, 3.2), cascade=1.0, alpha=2.6, bright=0.88, whistle=0.15, hiss=0.6),
+    "softwood": dict(rate=(6.0, 10.0), cascade=2.0, alpha=2.1, bright=1.1, whistle=0.8, hiss=1.0),
+    "mixed": dict(rate=(4.0, 7.0), cascade=1.5, alpha=2.3, bright=1.0, whistle=0.4, hiss=0.8),
+    "hardwood": dict(rate=(2.2, 4.5), cascade=1.1, alpha=2.6, bright=0.9, whistle=0.15, hiss=0.6),
 }
 
 
@@ -63,7 +68,7 @@ class FirePlace:
     diameter: float        # fire base diameter (m): sets the puffing rate
     roar_hz: float         # where the roar's spectrum peaks
     coherence: float       # 1 = small point source, 0 = wide (both ears hear different parts)
-    mix_db: dict           # roar / fizz / hiss power (dB); crackle: how far strong pops peak above the average
+    mix_db: dict           # bed: roar / fizz / hiss power (dB, roar = 0); crackle: crackle power over the bed (dB)
     rate_scale: float = 1.0
     transmission: tuple | None = None  # (cutoff Hz, order, gain): stove walls / glass
     room: dict | None = None
@@ -80,7 +85,7 @@ def env_campfire(rng):
         title="Crackling Campfire",
         center=(_side(rng) * rng.uniform(0.0, 0.6), rng.uniform(1.6, 2.4), -0.6),
         size=(0.7, 0.7, 0.45), diameter=rng.uniform(0.5, 0.8), roar_hz=rng.uniform(170, 250),
-        coherence=0.45, mix_db=dict(roar=-4.0, crackle=13.0, fizz=-2.0, hiss=-8.0),
+        coherence=0.45, mix_db=dict(roar=0.0, fizz=-11.0, hiss=-20.0, crackle=1.0),
         room=dict(rt60=0.3, predelay_ms=12, damping=0.6, wet=0.05),  # trees and ground nearby
     )
 
@@ -91,7 +96,7 @@ def env_fireplace(rng):
         title="Crackling Fireplace",
         center=(_side(rng) * rng.uniform(0.4, 1.4), rng.uniform(2.5, 3.8), -0.45),
         size=(0.6, 0.35, 0.35), diameter=rng.uniform(0.35, 0.55), roar_hz=rng.uniform(130, 200),
-        coherence=0.65, mix_db=dict(roar=-3.0, crackle=12.0, fizz=-3.0, hiss=-9.0),
+        coherence=0.65, mix_db=dict(roar=0.0, fizz=-12.0, hiss=-21.0, crackle=1.0),
         transmission=(rng.uniform(5000, 8000), 1, 1.0),  # the hearth opening shades the top end
         room=dict(rt60=rng.uniform(0.45, 0.7), predelay_ms=8, damping=0.65, wet=0.22),
     )
@@ -103,7 +108,7 @@ def env_wood_stove(rng):
         title="Wood Stove Fire",
         center=(_side(rng) * rng.uniform(0.6, 1.5), rng.uniform(2.0, 3.0), -0.4),
         size=(0.35, 0.25, 0.25), diameter=rng.uniform(0.25, 0.35), roar_hz=rng.uniform(110, 170),
-        coherence=0.75, mix_db=dict(roar=0.0, crackle=9.0, fizz=-8.0, hiss=-13.0),
+        coherence=0.75, mix_db=dict(roar=0.0, fizz=-15.0, hiss=-24.0, crackle=1.0),
         rate_scale=0.8, transmission=(rng.uniform(1300, 2200), 1, 1.0),
         room=dict(rt60=rng.uniform(0.4, 0.6), predelay_ms=6, damping=0.7, wet=0.2), ticks=True,
     )
@@ -115,7 +120,7 @@ def env_bonfire(rng):
         title="Bonfire at Night",
         center=(_side(rng) * rng.uniform(0.0, 1.0), rng.uniform(4.5, 7.0), -0.2),
         size=(2.0, 2.0, 1.4), diameter=rng.uniform(1.5, 2.5), roar_hz=rng.uniform(70, 120),
-        coherence=0.35, mix_db=dict(roar=-1.0, crackle=12.0, fizz=-2.0, hiss=-9.0),
+        coherence=0.35, mix_db=dict(roar=0.0, fizz=-10.0, hiss=-19.0, crackle=1.0),
         rate_scale=2.5, room=dict(rt60=0.5, predelay_ms=20, damping=0.6, wet=0.08),
     )
 
@@ -158,23 +163,30 @@ POP_L = 1024
 
 
 def pop_modes(rng, a, bright):
-    """A crackle: a burst of very short broadband modes plus, often, a brief woody ring.
-    `a` is each pop's size (1 = a typical pop). Bigger pops are a little lower and longer."""
+    """A crackle: a sharp broadband snap, usually with a brief woody ring from the split
+    wood, and in bigger pops a short low knock from the burst of gas. `a` is each pop's
+    size (1 = a typical pop). Bigger pops are a little lower and longer."""
     E = len(a)
-    scale = np.clip(a, 0.2, 6.0) ** -0.18 * bright
+    scale = np.clip(a, 0.2, 6.0) ** -0.15 * bright
     k = 5
-    f = _loguni(rng, 900, 12000, (E, k)) * scale[:, None]
-    tau = rng.uniform(0.06e-3, 0.4e-3, (E, k)) / scale[:, None]
-    amp = rng.normal(0, 1, (E, k)) / np.sqrt(k) * a[:, None]
+    f = _loguni(rng, 1400, 13000, (E, k)) * scale[:, None]
+    tau = rng.uniform(0.05e-3, 0.3e-3, (E, k)) / scale[:, None]
+    amp = rng.normal(0, 0.2, (E, k)) / np.sqrt(k) * a[:, None]
     clicks = _modes(rng, np.minimum(f, 16000), tau, amp)
-    # The fragment's own ring (charred wood, an ember), in about half the pops.
-    fr = _loguni(rng, 700, 4500, (E, 2)) * scale[:, None]
-    q = rng.uniform(3, 10, (E, 2))
-    has = (rng.random((E, 1)) < 0.5)
-    ramp = rng.normal(0, 0.25, (E, 2)) * a[:, None] * has
+    # The split wood rings briefly (most pops): the "crack" in a crackle.
+    fr = _loguni(rng, 900, 4500, (E, 2)) * scale[:, None]
+    q = rng.uniform(6, 18, (E, 2))
+    has = rng.random((E, 1)) < 0.85
+    ramp = rng.choice([-1.0, 1.0], (E, 2)) * rng.uniform(0.55, 1.0, (E, 2)) * 0.9 * a[:, None] * has
     rings = _modes(rng, fr, q / (np.pi * fr), ramp)
+    # Bigger pops also knock: the gas pocket bursting gives a short, low "thock".
+    fb = _loguni(rng, 250, 700, (E, 1))
+    qb = rng.uniform(1.5, 3.0, (E, 1))
+    hb = rng.random((E, 1)) < np.clip((a[:, None] - 0.6) / 2.0, 0, 0.7)
+    bamp = rng.normal(0, 0.4, (E, 1)) * np.sqrt(np.clip(a, 0, 6))[:, None] * hb
+    body = _modes(rng, fb, qb / (np.pi * fb), bamp)
     attack = rng.uniform(1.5e-5, 8e-5, E)
-    return _clamp(_stack([clicks, rings], attack), POP_L)
+    return _clamp(_stack([clicks, rings, body], attack), POP_L)
 
 
 def fizz_modes(rng, a):
@@ -297,7 +309,7 @@ class FireScene(Layer):
     dampness     0 dry .. 1 damp (more steam hiss, sizzle and singing)
     variability  how far the fire wanders between brighter and lower spells
     budget       individually rendered ember ticks per second (default depends on device)
-    crest_db     loudest any single crackle may peak above the fire's average level
+    crest_db     loudest the fire may ever peak above its average level (sleep safety)
     """
 
     pannable = False
@@ -323,12 +335,14 @@ class FireScene(Layer):
         self.bright = w["bright"]
         self.whistle_per_s = w["whistle"] * self.damp / 60.0
         self.settle_gap = env_rng.uniform(150, 420)  # s between log settles, on average
-        self.fizz_phys = 900.0 * place.rate_scale ** 0.5 * (1 + 1.5 * self.damp)  # ticks/s at intensity 1
+        # Ember ticks per second at intensity 1: a sprinkle of distinct ticks, not a wash.
+        self.fizz_phys = 80.0 * place.rate_scale ** 0.5 * (1 + 1.5 * self.damp)
         budget = int(budget or gpu.default_budget())
         self.fizz_rate = min(self.fizz_phys, 0.5 * budget)
         self.fizz_amp = np.sqrt(self.fizz_phys / self.fizz_rate)  # fewer ticks, same energy
-        self.pop_cap = 5.0  # biggest pop, relative to a typical one (soft limit)
+        self.pop_cap = 2.5  # biggest pop, relative to a typical one (soft limit)
         self.crest_db = crest_db
+        self.limiter = PeakLimiter(10 ** (crest_db / 20), relative_s=2.0)  # output is ~unit RMS
         self.gain = None  # set by _calibrate
         self.mute = set()  # parts to leave out (for listening to one part alone)
 
@@ -339,8 +353,8 @@ class FireScene(Layer):
         self.activity = _OU(child(rng), env_rng.uniform(3.0, 7.0))
         self.hiss_wander = _OU(child(rng), env_rng.uniform(4.0, 12.0))
         self.puff = _Puff(child(rng), 1.5 / np.sqrt(place.diameter) * env_rng.uniform(0.9, 1.1))
-        self.puff_depth = env_rng.uniform(0.2, 0.4)
-        self.flicker_depth = env_rng.uniform(0.2, 0.35)
+        self.puff_depth = env_rng.uniform(0.1, 0.2)  # gentle: deep, fast swells sound like gusting wind
+        self.flicker_depth = env_rng.uniform(0.1, 0.2)
         self.flare = 0.0
 
         self.ev_rng = child(rng)
@@ -372,7 +386,7 @@ class FireScene(Layer):
         self.path = path
         fp = place.roar_hz
         grid = np.geomspace(20, 20000, 80)
-        roar = (grid / fp) ** 2 / (1 + (grid / fp) ** 2) / (1 + (grid / fp) ** 1.4)  # rise, peak, ~-8 dB/oct
+        roar = (grid / fp) ** 2 / (1 + (grid / fp) ** 2) / (1 + (grid / fp) ** 2.0)  # rise, peak, -12 dB/oct
         self.roar_fir = _FIR(_spectrum_fir(list(zip(grid, roar)), path))
         hiss = (grid / 3500.0) ** 2 / (1 + (grid / 1800.0) ** 4) ** 0.5 / (1 + (grid / 7000.0) ** 3)
         self.hiss_fir = _FIR(_spectrum_fir(list(zip(grid, hiss)), path))
@@ -405,41 +419,40 @@ class FireScene(Layer):
 
     def _pop_sizes(self, rng, k):
         a = (1 - rng.random(k)) ** (-1 / self.alpha) / 2 ** (1 / self.alpha)  # Pareto, median 1
+        # Heard sizes are gentler than the physics (a fire close by has some loud pops; for
+        # sleep they are evened out, so the crackle texture carries rather than a few bangs).
+        a = a ** 0.5
         return self.pop_cap * np.tanh(a / self.pop_cap)
 
     def _pops(self, rng, times, sizes):
         """Primary pops plus the little cascade each sets off (more cracks within tens of
-        milliseconds). Each crack is itself a rough burst of a few micro-fractures over a
-        few milliseconds, not one clean click: that is what makes a crackle sound like
-        wood (and it carries more sound for the same peak, so crackles stay audible under
-        the sleep-safety limit)."""
+        milliseconds). Each crack is itself a short run of micro-fractures: the first and
+        loudest, then a sputter of smaller ones that dies away over a few tens of
+        milliseconds. That is what makes a crackle sound like wood rather than a click, and
+        it carries more sound for the same peak, so crackles stay clear under the
+        sleep-safety limit."""
         n_sec = rng.poisson(self.cascade, len(times))
         par = np.repeat(np.arange(len(times)), n_sec)
         t2 = times[par] + rng.exponential(0.008 * SR, len(par))
-        a2 = sizes[par] * rng.uniform(0.1, 0.55, len(par))
+        a2 = sizes[par] * rng.uniform(0.25, 0.65, len(par))
         t, a = np.concatenate([times, t2]), np.concatenate([sizes, a2])
-        n_mic = 1 + rng.poisson(3.0, len(t))
+        # Bigger cracks sputter on for longer.
+        n_mic = rng.poisson(4.0 + 3.0 * np.minimum(a, 3.0))
         par = np.repeat(np.arange(len(t)), n_mic)
-        dur = rng.uniform(0.8e-3, 5e-3, len(t)) * np.clip(a, 0.2, 6) ** 0.3 * SR
-        tm = t[par] + rng.random(len(par)) ** 1.5 * dur[par]
-        am = a[par] * rng.uniform(0.35, 1.0, len(par)) / np.sqrt(n_mic[par]) * 1.4
-        return tm, am
+        gap = rng.exponential(0.0025 * SR, len(par))
+        cs = np.cumsum(gap)
+        first = np.cumsum(n_mic) - n_mic
+        off = cs - np.repeat(np.concatenate([[0.0], cs])[first], n_mic)
+        tau = rng.uniform(0.01, 0.025, len(t)) * SR
+        am = a[par] * rng.uniform(0.4, 0.85, len(par)) * np.exp(-off / tau[par])
+        return np.concatenate([t, t[par] + off]), np.concatenate([a, am])
 
-    def _limit(self, amps, part):
-        """Sleep safety: no single event may peak more than `crest_db` above the fire's
-        average level. Its worst-case peak (all modes in phase) is softly limited."""
-        if self.gain is None:
-            return amps
-        T = 10 ** (self.crest_db / 20) / (self.gain * self.g[part])
-        est = np.abs(amps).sum(axis=2).max(axis=0)
-        return amps * (T * np.tanh(est / T) / np.maximum(est, 1e-30))[None, :, None]
-
-    def _emit(self, q, rng, times, sizes, voice, part, through=True):
+    def _emit(self, q, rng, times, sizes, voice, through=True):
         if len(times) == 0:
             return
         m = voice(rng, sizes)
         delays, amps = self._spatial(m, self._positions(rng, len(times)), through)
-        q.push(times, m, delays, self._limit(amps, part))
+        q.push(times, m, delays, amps)
 
     def _pop_voice(self, rng, sizes):
         return pop_modes(rng, sizes, self.bright)
@@ -474,27 +487,26 @@ class FireScene(Layer):
         k = rng.poisson(lam)
         t = np.repeat(starts, k) + rng.random(k.sum()) * CTRL
         t, a = self._pops(rng, t, self._pop_sizes(rng, len(t)))
-        self._emit(self.q_pop, rng, t, a, self._pop_voice, "crackle")
+        self._emit(self.q_pop, rng, t, a, self._pop_voice)
         # Ember fizz follows the flames closely.
         k = rng.poisson(self.fizz_rate * (inten / self.mean_i) * flick * dt)
         t = np.repeat(starts, k) + rng.random(k.sum()) * CTRL
         a = rng.lognormal(0, 0.7, len(t)) * self.fizz_amp
-        self._emit(self.q_fizz, rng, t, a, fizz_modes, "fizz")
+        self._emit(self.q_fizz, rng, t, a, fizz_modes)
         # Settling logs: a soft cluster of ticks over about a second and a low knock.
         if settle_at is not None:
             t0 = u0 + settle_at * CTRL
             n = int(rng.integers(15, 50))
             dur = rng.uniform(0.4, 1.4) * SR
             t = t0 + dur * rng.beta(1.5, 3.0, n)
-            self._emit(self.q_pop, rng, t, rng.uniform(0.1, 0.5, n), self._pop_voice, "crackle")
-            self._emit(self.q_low, rng, np.array([t0 + rng.uniform(0, 0.1) * SR]), np.array([0.9]), thump_modes,
-                       "crackle")
+            self._emit(self.q_pop, rng, t, rng.uniform(0.1, 0.5, n), self._pop_voice)
+            self._emit(self.q_low, rng, np.array([t0 + rng.uniform(0, 0.1) * SR]), np.array([0.9]), thump_modes)
         if self.place.ticks:
             k = rng.poisson(1 / 25.0)
             if k:
                 # On the outside of the stove, so not muffled by its walls.
                 self._emit(self.q_low, rng, u0 + rng.random(k) * UNIT, rng.uniform(0.2, 0.5, k), tick_modes,
-                           "crackle", through=False)
+                           through=False)
         # Sap and steam "singing": rare, soft, gliding, fades in and out.
         if rng.random() < self.whistle_per_s:
             self._new_whistle(u0 + rng.random() * UNIT)
@@ -520,7 +532,8 @@ class FireScene(Layer):
     # -- calibration -------------------------------------------------------------------
     def _calibrate(self, rng):
         """Set each part's gain from its expected power at the average intensity, then
-        mix them at the setting's balance."""
+        mix them at the setting's balance: the bed (roar, ember ticks, hiss) by `mix_db`
+        (roar = 0 dB), and the crackles `crackle` dB above the whole bed."""
         def energy(m, amps):  # expected energy per event (both ears, sum of squares)
             return float(np.mean(np.sum(amps ** 2 * (m.tau * SR / 4)[None], axis=(0, 2))))
 
@@ -528,31 +541,20 @@ class FireScene(Layer):
         t, a = self._pops(rng, np.zeros(n), self._pop_sizes(rng, n))
         m_pop = pop_modes(rng, a, self.bright)
         _, a_pop = self._spatial(m_pop, self._positions(rng, len(a)))
-        per_primary = len(a) / n
         m_fizz = fizz_modes(rng, rng.lognormal(0, 0.7, n) * self.fizz_amp)
         _, a_fizz = self._spatial(m_fizz, self._positions(rng, n))
-        p_roar = float(np.sum(self.roar_fir.h ** 2))
-        p_hiss = float(np.sum(self.hiss_fir.h ** 2))
         mix = dict(self.place.mix_db)
         mix["hiss"] = mix["hiss"] + 10 * self.damp * self.wood["hiss"]
-        wet = self.room_wet ** 2 if self.room is not None else 0.0
-        # The steady parts are set by power (`mix_db`). Crackles are set by how high they
-        # peak: a strong crackle (the 90th percentile) peaks `crackle` dB above the fire's
-        # average level, and the very biggest are softly limited at `crest_db`. Crackles
-        # change the average level a little, so settle it in a few rounds.
-        p = {"roar": p_roar, "hiss": p_hiss}
+        mix["crackle"] = mix["crackle"] + 10 * np.log10(sum(10 ** (mix[k] / 10) for k in ("roar", "hiss", "fizz")))
+        p = {
+            "roar": float(np.sum(self.roar_fir.h ** 2)),
+            "hiss": float(np.sum(self.hiss_fir.h ** 2)),
+            "fizz": self.fizz_rate * energy(m_fizz, a_fizz) / SR / 2,
+            "crackle": self.crackle_rate * len(a) / n * energy(m_pop, a_pop) / SR / 2,
+        }
         self.g = {k: 10 ** (mix[k] / 20) / np.sqrt(max(p[k], 1e-30)) for k in p}
-        steady = sum(self.g[k] ** 2 * p[k] for k in p)
-        pk_pop = np.percentile(np.abs(a_pop).sum(axis=2).max(axis=0), 90)
-        p_fizz = self.fizz_rate * energy(m_fizz, a_fizz) / SR / 2
-        self.g["fizz"] = 10 ** (mix["fizz"] / 20) / np.sqrt(max(p_fizz, 1e-30))
-        self.gain = 1.0 / np.sqrt(steady + self.g["fizz"] ** 2 * p_fizz)
-        for _ in range(8):
-            self.g["crackle"] = 10 ** (mix["crackle"] / 20) / (self.gain * pk_pop)
-            p_c = self.crackle_rate * energy(m_pop, self._limit(a_pop, "crackle")) * per_primary / SR / 2
-            p_f = self.fizz_rate * energy(m_fizz, self._limit(a_fizz, "fizz")) / SR / 2
-            total = steady + self.g["crackle"] ** 2 * p_c + self.g["fizz"] ** 2 * p_f
-            self.gain = 1.0 / np.sqrt(total * (1 + wet))
+        wet = self.room_wet ** 2 if self.room is not None else 0.0
+        self.gain = 1.0 / np.sqrt(sum(10 ** (mix[k] / 10) for k in p) * (1 + wet))
 
     # -- main ----------------------------------------------------------------------------
     def _env(self, col, start, n):
@@ -601,4 +603,4 @@ class FireScene(Layer):
         if self.room is not None:
             out = out + self.room_wet * self.room(out)
         self.pos = end
-        return out * self.gain
+        return self.limiter(out * self.gain)

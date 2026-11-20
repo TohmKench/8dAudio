@@ -142,6 +142,57 @@ def soft_limit(x: np.ndarray, threshold: float = 0.6, ceiling: float = 0.89) -> 
     return y
 
 
+class PeakLimiter:
+    """Look-ahead peak limiter: no sample leaves louder than `threshold`, and nothing else
+    changes. Around each peak the gain dips smoothly (no clipping, so no distortion).
+
+    The gain at a sample is the moving average (2W + 1 wide) of the running minimum (2W + 1
+    wide) of the gain each sample needs. Every sample in that average's reach needs at most
+    what the sample itself needs, so the limit always holds, and the gain moves over about
+    4W samples. Output is delayed by 2W samples; the chunk size never changes it.
+
+    With `relative_s`, the limit also follows the recent level, for signals whose nominal
+    RMS is 1: it is `threshold` times the running RMS of the last few seconds when that is
+    below 1 (but at least `floor` times `threshold`), so a sound can't jump out of a lull.
+    """
+
+    def __init__(self, threshold: float, window_ms: float = 2.0, channels: int = 2,
+                 relative_s: float | None = None, floor: float = 0.25):
+        self.threshold = float(threshold)
+        self.W = max(1, int(round(window_ms * 1e-3 * SR)))
+        self.hist = np.zeros((4 * self.W, channels))
+        self.relative = relative_s is not None
+        if self.relative:
+            self.a = a = np.exp(-1.0 / (relative_s * SR))
+            self.ms_b, self.ms_a = [1 - a], [1.0, -a]
+            self.ms_zi = np.zeros(1)
+            self.seen = 0  # samples so far: early on, the average covers only those
+            self.floor = floor
+            self.thist = np.full(4 * self.W, self.threshold)
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        from scipy.ndimage import minimum_filter1d, uniform_filter1d
+
+        n, W = len(x), self.W
+        xx = np.concatenate([self.hist, x])
+        self.hist = xx[-4 * W:].copy()
+        y = xx[2 * W: 2 * W + n]
+        peak = np.abs(xx).max(axis=1)
+        T = self.threshold
+        if self.relative:
+            ms, self.ms_zi = signal.lfilter(self.ms_b, self.ms_a, np.mean(x * x, axis=1), zi=self.ms_zi)
+            ms = ms / -np.expm1((self.seen + 1 + np.arange(n)) * np.log(self.a))
+            self.seen += n
+            t_new = self.threshold * np.clip(np.sqrt(ms), self.floor, 1.0)
+            T = np.concatenate([self.thist, t_new])
+            self.thist = T[-4 * W:].copy()
+        if np.all(peak <= T):
+            return y.copy()
+        need = np.minimum(1.0, T / np.maximum(peak, 1e-30))
+        gain = uniform_filter1d(minimum_filter1d(need, 2 * W + 1), 2 * W + 1)
+        return y * np.minimum(gain[2 * W: 2 * W + n], 1.0)[:, None]
+
+
 class Convolver:
     """Streaming FFT convolution (overlap-add) of (frames, channels) blocks with a fixed
     impulse response `h`, shaped (taps,) for every channel or (taps, channels).

@@ -296,6 +296,52 @@ def test_fire_is_chunk_invariant_level_and_sleep_safe(env):
     assert 20 * np.log10(np.percentile(np.abs(a), 99.99) / rms(a)) > 10
 
 
+def test_fire_crackles_lead_a_quiet_bed():
+    """Heard as cracks and pops over a soft bed, not as static or wind: the crackles are
+    louder than the roar, and the ember ticks and hiss stay far down."""
+    for env in ("campfire", "fireplace"):
+        parts = {}
+        for keep in ("crackle", "roar", "fizz", "hiss", None):
+            s = FireScene(np.random.default_rng(2), environment=env, budget=600)
+            if keep:  # one part alone, unlimited (the limiter follows the whole fire's level)
+                s.mute = {k for k in s.g if k != keep}
+                s.limiter.threshold = np.inf
+            parts[keep] = loudness_lufs(s(int(12 * SR)))
+        whole = parts.pop(None)
+        assert parts["crackle"] > parts["roar"] + 1.0
+        assert parts["crackle"] > whole - 4
+        assert parts["fizz"] < whole - 10 and parts["hiss"] < whole - 12
+
+
+def test_peak_limiter_holds_its_limit_and_ignores_chunking():
+    from sleepgen.dsp import PeakLimiter
+
+    rng = np.random.default_rng(0)
+    x = rng.normal(0, 0.3, (SR * 5, 2)) * np.linspace(1, 0.3, SR * 5)[:, None]
+    for t in rng.integers(0, SR * 5 - 300, 60):
+        x[t:t + 200] += rng.normal(0, 1, (200, 2)) * np.exp(-np.arange(200) / 40)[:, None] * rng.uniform(1, 8)
+
+    def run(chunk, **kw):
+        lim, out = PeakLimiter(4.0, **kw), []
+        for i in range(0, len(x), chunk):
+            out.append(lim(x[i:i + chunk]))
+        return np.concatenate(out)
+
+    from scipy.ndimage import maximum_filter1d
+
+    d = 2 * PeakLimiter(4.0).W  # the output is delayed by this many samples
+    calm = maximum_filter1d(np.abs(x).max(axis=1), 4 * d + 1)[:-d] < 1.0  # no peak anywhere near
+    assert calm.sum() > SR // 10
+    for kw in ({}, {"relative_s": 1.0}):
+        a = run(SR, **kw)
+        np.testing.assert_allclose(a, run(7777, **kw), atol=1e-12)
+        assert np.abs(a).max() <= 4.0 + 1e-9
+        # Away from the peaks nothing changes.
+        np.testing.assert_allclose(a[d:][calm], x[:-d][calm], atol=1e-12)
+    # Following the recent level, it holds a lull's pops lower than the fixed limit does.
+    assert np.abs(run(SR, relative_s=1.0)[-SR:]).max() < np.abs(run(SR)[-SR:]).max()
+
+
 def test_fire_is_deterministic_and_woods_differ():
     np.testing.assert_allclose(_fire_out("campfire", 1.0, 2.0, seed=4), _fire_out("campfire", 1.0, 2.0, seed=4),
                                atol=1e-4)

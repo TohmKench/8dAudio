@@ -114,18 +114,28 @@ Recipe parameters: `environment`, `rain_mm_h` (light 1 to 2.5, moderate 2.5 to 7
 | `wood_stove` | A cast iron stove with a glass door: muffled crackles, a steady draw, ticking iron |
 | `bonfire` | A big bonfire a few metres off: deep, slow roar and busy crackling |
 
-- **Flame roar.** Turbulent combustion as a soft, low rush. Flames "puff" at a rate set by the fire's
-  size (about 1.5 / sqrt(diameter) Hz), so a bonfire breathes slowly and a stove quickly, with random
-  flicker on top.
+The crackles lead and everything else is a soft, quiet bed under them, the way a real fire close by
+is mostly heard as its cracks and pops rather than as a rushing noise.
+
 - **Crackles.** Each crack of drying wood or burst of sap is an event placed in 3D inside the fire bed:
-  a rough burst of micro-fractures over a few milliseconds, often with a short woody ring. They come in
-  clusters, with a heavy-tailed spread of sizes and busy and quiet spells.
-- **Ember fizz.** Thousands of tiny ticks a second, rendered one by one (the GPU budget sets how many).
-- **Steam hiss.** A breathy hiss that grows with damp wood, and now and then a soft, gliding "singing" jet.
+  a sharp snap with a brief woody ring from the split wood, then a short sputter of smaller fractures
+  that dies away over a few tens of milliseconds (bigger cracks sputter longer). They come in clusters,
+  with busy and quiet spells, and their sizes are evened out for sleep: lots of clear crackles, no bangs.
+- **Flame roar.** Turbulent combustion as a soft, low rumble, a few dB under the crackles. Flames "puff"
+  at a rate set by the fire's size (about 1.5 / sqrt(diameter) Hz), so a bonfire breathes slowly and a
+  stove quickly, with gentle random flicker on top (deep, fast swells sound like gusting wind).
+- **Ember ticks.** A light sprinkle of tiny ticks, each one distinct, well under the crackles.
+- **Steam hiss.** A faint breathy hiss that grows with damp wood, and now and then a soft, gliding
+  "singing" jet.
 - **Settling logs.** Every few minutes, a soft cluster of ticks and a low knock, and the fire flares up a
   little for a while afterwards.
-- **Sleep safety.** A strong crackle peaks about 12 dB above the fire's average level, and none can
-  peak more than 19 dB above it (`crest_db`).
+- **Sleep safety.** A look-ahead peak limiter keeps every peak within `crest_db` (19 dB) of the fire's
+  level over the last couple of seconds, so a pop never jumps out of a quiet spell. It turns a loud crack
+  down smoothly over a few milliseconds instead of clipping it, and leaves everything else untouched.
+
+Balance per setting is `mix_db`: the bed by power (roar 0 dB, ember ticks about -11, hiss about -20) and
+`crackle`, the crackles' power over the whole bed (+1 dB; in loudness the crackles come out about 3 LU
+over the roar, because they sit where hearing is most sensitive).
 
 Parameters: `environment`, `intensity` (0.5 gentle to 1.35 roaring), `wood` (`softwood` pops and hisses,
 `mixed`, `hardwood` is steadier and deeper), `dampness` (0 to 1), `variability`, `crest_db`. Fire sets
