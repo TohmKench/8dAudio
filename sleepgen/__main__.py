@@ -70,6 +70,7 @@ def main(argv=None) -> int:
     pv.add_argument("--seed", type=int, default=1)
     pv.add_argument("--library")
     pv.add_argument("--rain", action="store_true", help="one clip of rain in every environment instead")
+    pv.add_argument("--rate", type=float, help="with --rain: rainfall in mm/h (default: random per seed)")
 
     bn = sub.add_parser("bench", help="time rain rendering on this machine and project a 10 hour render")
     bn.add_argument("--seconds", type=float, default=20)
@@ -155,6 +156,8 @@ def main(argv=None) -> int:
         for env in ENVIRONMENTS:
             recipe = random_recipe(args.seed, "rain", args.library, secondaries=[], accents=[])
             recipe["layers"][0]["params"]["environment"] = env
+            if args.rate:
+                recipe["layers"][0]["params"]["rain_mm_h"] = args.rate
             recipe["meta"]["headline"] = ENVIRONMENTS[env]["title"]
             recipe["master"].update(fade_in_s=3, fade_out_s=3)
             out = os.path.join(args.dir, f"rain-{env}.mp3")

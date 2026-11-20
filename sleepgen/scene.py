@@ -140,15 +140,16 @@ def _side(rng):
 
 
 def env_roof(rng):
-    """In bed under a tiled roof: muffled patter through the ceiling, a window to one
-    side, a gutter dripping into a drain outside."""
+    """In bed in a loft room right under a tiled roof: close, softened patter through
+    the roof (tiles, felt and boards: about 6 dB per octave above 1-2 kHz), a window
+    to one side, a gutter dripping into a drain outside."""
     h = rng.uniform(2.6, 3.6)
     side = _side(rng)
     return dict(
         indoor=True,
         patches=[
             Patch("roof", "tile", (0, 0.5, h), (10, 9, 0), weight=0.85,
-                  transmission=(rng.uniform(500, 900), 2, 1.0)),
+                  transmission=(rng.uniform(1000, 1800), 1, 1.0)),
             Patch("window", "glass", (side * 2.2, 1.0, 0.3), (0, 1.2, 1.3), weight=0.15,
                   wind_driven=True, gain_db=-4),
             Patch("gutter", "water_drip", (side * 3.6, rng.uniform(-1, 3), -1.2), (0.5, 0.5, 0),
@@ -234,13 +235,17 @@ def env_forest(rng):
 
 
 def env_tent(rng):
-    """Lying in a tent: the fly sheet drumming just above you, the odd fat drop from
-    the trees, wet grass and woods outside."""
+    """Lying in a small ridge tent: the fly sheet sloping down on both sides close to
+    your ears, the odd fat drop from the trees, wet grass and woods outside."""
+    # Each side of the fly is a sloped sheet from the ridge (~0.9 m up) down to the
+    # ground beside you; the box spans that slope, and rain lands on its plan area.
+    w = rng.uniform(0.6, 0.8)
     return dict(
         indoor=True,
         patches=[
-            Patch("tent", "fabric", (0, 0, 0.8), (2.2, 2.4, 0), weight=0.85),
-            Patch("tree_drips", "fabric", (0, 0, 0.8), (2.2, 2.4, 0), fixed_d=(3.5, 5.5),
+            Patch("fly_left", "fabric", (-w / 2, 0, 0.35), (w, 2.4, 0.8), weight=0.425),
+            Patch("fly_right", "fabric", (w / 2, 0, 0.35), (w, 2.4, 0.8), weight=0.425),
+            Patch("tree_drips", "fabric", (0, 0, 0.35), (2 * w, 2.4, 0.8), fixed_d=(3.5, 5.5),
                   fixed_rate=rng.uniform(0.3, 1.5), fall_height=5.0),
             Patch("grass", "ground", (0, 0, -0.25), (10, 10, 0), weight=0.15,
                   transmission=(3000, 1, 0.6)),

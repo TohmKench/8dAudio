@@ -63,7 +63,7 @@ falling on everything around them, drop by drop:
 
 | Environment | What you hear |
 |---|---|
-| `roof` | Tile roof overhead (muffled through the ceiling), a side window, a gutter drip, the garden outside |
+| `roof` | A loft room right under a tiled roof (softened through it), a side window, a gutter drip, the garden outside |
 | `tin_roof` | Corrugated metal sheets ringing above you, drips off the eaves |
 | `window` | Wind-driven rain on glass right beside you, a stone sill, the street and rooftops beyond |
 | `lake` | Rain on open water (tiny bubbles "fizz"), the shore, the treeline across the lake |

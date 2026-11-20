@@ -168,10 +168,12 @@ PLATE_MATERIALS = {
                   n_modes=48, m=12, gain=0.55, clicks=(3, 2000, 14000, 0.04e-3, 0.15e-3, 0.6),
                   boom=(2, 45, 110, 4, 8, 0.35), panel=(0.9, 2.4), L=7680),
     "glass": dict(membrane=False, f11=(14, 24), band=(250, 4500), q=(12, 35), cap=0.006,
-                  n_modes=90, m=12, gain=0.08, clicks=(5, 2500, 14000, 0.04e-3, 0.2e-3, 1.0),
+                  n_modes=90, m=12, gain=0.08, clicks=(5, 2500, 14000, 0.04e-3, 0.2e-3, 0.6),
                   boom=None, panel=(1.0, 1.25), L=2880),
-    "fabric": dict(membrane=True, f11=(30, 50), band=(70, 1100), q=(4, 12), cap=0.018,
-                   n_modes=30, m=8, gain=0.6, clicks=(4, 700, 5000, 0.12e-3, 0.5e-3, 0.8),
+    # Fabric: a light nylon fly sheet. A bright tap (it is thin and light, so the contact
+    # is short) over a soft drum-like tone from the taut sheet.
+    "fabric": dict(membrane=True, f11=(30, 50), band=(70, 2200), q=(4, 12), cap=0.018,
+                   n_modes=36, m=8, gain=0.25, clicks=(5, 900, 9000, 0.06e-3, 0.3e-3, 1.0),
                    boom=None, panel=(1.1, 2.3), L=3840),
 }
 
@@ -208,10 +210,13 @@ class Plate(Surface):
             lo, hi = spec["band"]
             ok = np.flatnonzero((f.ravel() >= lo) & (f.ravel() <= hi))
             if len(ok) > spec["n_modes"]:
-                # Keep a spread across the band (log-spaced picks), not just the lowest ones.
-                order = ok[np.argsort(f.ravel()[ok])]
-                picks = np.unique(np.round(np.geomspace(1, len(order), spec["n_modes"])).astype(int) - 1)
-                ok = order[picks]
+                # Keep a spread across the band: one randomly chosen mode from each of
+                # n_modes log-spaced slices. Random within the slice, so the sheets don't
+                # all share a mode at the same frequency (that adds up to a steady whine).
+                fr = f.ravel()[ok]
+                edges = np.geomspace(lo, hi, spec["n_modes"] + 1)
+                slot = np.clip(np.searchsorted(edges, fr, side="right") - 1, 0, spec["n_modes"] - 1)
+                ok = np.array([rng.choice(ok[slot == j]) for j in np.unique(slot)])
             self.panels.append(dict(f=f.ravel()[ok], m=mm.ravel()[ok], n=nn.ravel()[ok],
                                     q=rng.uniform(*spec["q"], len(ok))))
         k = max(len(p["f"]) for p in self.panels)
