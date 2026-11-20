@@ -199,7 +199,7 @@ def main(argv=None) -> int:
             recipe["layers"][0]["params"]["environment"] = env
             if args.intensity:
                 recipe["layers"][0]["params"]["intensity"] = args.intensity
-            recipe["meta"]["headline"] = FIRE_ENVIRONMENTS[env]["title"]
+            recipe["meta"]["headline"] = recipe["meta"]["base_label"] = FIRE_ENVIRONMENTS[env]["title"]
             recipe["master"].update(fade_in_s=3, fade_out_s=3)
             out = os.path.join(args.dir, f"fire-{env}.mp3")
             report = render_with_sidecar(recipe, out, args.seconds, bitrate="256k", progress=False)
