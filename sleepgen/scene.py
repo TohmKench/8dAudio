@@ -140,10 +140,14 @@ class FilterBank:
 
     def render(self, buf, pos, member, amp):
         """pos (C, Q) whole-sample positions in `buf` (2, N); member (Q,); amp (C, Q)."""
+        self.prepare(pos, member, amp)(buf)
+
+    def prepare(self, pos, member, amp):
+        """Sort and upload the impulses now; returns the job that renders them into a buffer
+        (so all uploads can happen before any GPU work is queued, see RainScene.__call__)."""
         torch = gpu._torch()
         if pos.shape[1] == 0:
-            return
-        dev = buf.device
+            return lambda buf: None
         C, R, nfft, Nb = self.C, self.R, self.nfft, self.Nb
         blk = pos // Nb
         flat = (np.arange(C)[:, None] * R + member[None]) * nfft + (pos - blk * Nb)
@@ -153,23 +157,27 @@ class FilterBank:
         bounds = np.searchsorted(blk, np.arange(blk[-1] + 2))
         flat_t = gpu.upload(flat)
         a_t = gpu.upload(a, torch.float32)
-        x = torch.zeros(C * R * nfft, device=dev)
         F = nfft // 2 + 1
         rc = max(1, (1 << 23) // (2 * F))  # resonances per multiply-and-sum step (bounded temporaries)
-        for b in np.flatnonzero(np.diff(bounds)):
-            lo, hi = int(bounds[b]), int(bounds[b + 1])
-            x.zero_()
-            x.index_add_(0, flat_t[lo:hi], a_t[lo:hi])
-            X = torch.fft.rfft(x.view(C, R, nfft), dim=2)
-            if C == 1:  # per panel: weight each mode per ear, then delay each panel per ear
-                Z = torch.bmm(self.G, (X[0] * self.W).view(self.P, self.K, F))  # (P, 2, F)
-                Y = (Z * self.phase).sum(0)
-            else:
-                Y = torch.zeros(2, F, dtype=X.dtype, device=dev)
-                for r0 in range(0, R, rc):
-                    Y += (X[:, r0:r0 + rc] * self.W[r0:r0 + rc]).sum(1)
-            s = int(b) * Nb
-            buf[:, s:s + nfft] += torch.fft.irfft(Y, nfft, dim=1)
+        blocks = [(int(b), int(bounds[b]), int(bounds[b + 1])) for b in np.flatnonzero(np.diff(bounds))]
+
+        def run(buf):
+            dev = buf.device
+            x = torch.zeros(C * R * nfft, device=dev)
+            for b, lo, hi in blocks:
+                x.zero_()
+                x.index_add_(0, flat_t[lo:hi], a_t[lo:hi])
+                X = torch.fft.rfft(x.view(C, R, nfft), dim=2)
+                if C == 1:  # per panel: weight each mode per ear, then delay each panel per ear
+                    Z = torch.bmm(self.G, (X[0] * self.W).view(self.P, self.K, F))  # (P, 2, F)
+                    Y = (Z * self.phase).sum(0)
+                else:
+                    Y = torch.zeros(2, F, dtype=X.dtype, device=dev)
+                    for r0 in range(0, R, rc):
+                        Y += (X[:, r0:r0 + rc] * self.W[r0:r0 + rc]).sum(1)
+                s = b * Nb
+                buf[:, s:s + nfft] += torch.fft.irfft(Y, nfft, dim=1)
+        return run
 
 
 def _wave(dev, f, tau, L, ph, chirp=None, att=None):
@@ -229,10 +237,10 @@ class PlateBank:
         idx = self.idx[panel, spot, size] + (panel * self.K)[:, None]
         return idx, self.amp[panel, spot, size] * strength[:, None]
 
-    def render(self, buf, start, idx, amp):
+    def prepare(self, start, idx, amp):
         E, m = idx.shape
         pos = np.repeat(np.round(start).astype(np.int64), m)[None]
-        self.bank.render(buf, pos, idx.ravel(), amp.ravel()[None])
+        return self.bank.prepare(pos, idx.ravel(), amp.ravel()[None])
 
 
 class DropPool:
@@ -296,19 +304,22 @@ class DropPool:
             out.append((np.concatenate(idx, axis=1), np.concatenate(amp, axis=1), np.concatenate(f, axis=1)))
         return out
 
-    def render(self, buf, start, delays, att, picks):
-        """start (E,), delays (2, E) samples, att (E,) s; picks: per group (idx (E, k), amps (2, E, k))."""
+    def prepare(self, start, delays, att, picks):
+        """start (E,), delays (2, E) samples, att (E,) s; picks: per group (idx (E, k), amps (2, E, k)).
+        Returns the jobs that render them (see FilterBank.prepare)."""
+        jobs = []
         for (_, _, wave, fb), (idx, amps) in zip(self.groups, picks):
             if fb is None:
-                render_pool(buf, start, delays, att, idx, amps, wave)
+                jobs.append(prepare_pool(start, delays, att, idx, amps, wave))
             else:
                 E, k = idx.shape
                 pos = np.repeat(np.round(start).astype(np.int64)[None] + np.round(delays).astype(np.int64), k, axis=1)
-                fb.render(buf, pos, idx.ravel(), amps.reshape(2, -1))
+                jobs.append(fb.prepare(pos, idx.ravel(), amps.reshape(2, -1)))
+        return jobs
 
 
-def render_pool(buf, start, delays, att, idx, amps, wave):
-    """Add drops made of pool members into `buf` (2, N).
+def prepare_pool(start, delays, att, idx, amps, wave):
+    """Upload drops made of pool members; returns the job that adds them into a buffer (2, N).
 
     start (E,) onset in samples relative to buf[0]; delays (2, E) per-ear delay in samples;
     att (E,) attack time (s); idx (E, k) members of `wave` (J, L); amps (2, E, k).
@@ -316,12 +327,9 @@ def render_pool(buf, start, delays, att, idx, amps, wave):
     torch = gpu._torch()
     E, k = idx.shape
     if E == 0:
-        return
-    dev = buf.device
+        return lambda buf: None
     L = wave.shape[1]
     A = min(L, 96)  # the attack (<= 0.3 ms) is over well within 96 samples
-    na = torch.arange(A, device=dev, dtype=torch.float32) / SR
-    nl = torch.arange(L, device=dev)
     i0 = np.round(start).astype(np.int64)
     d_int = np.round(delays).astype(np.int64)
     bs = max(1, gpu.batch_elements() // (k * L + 2 * L))
@@ -329,12 +337,23 @@ def render_pool(buf, start, delays, att, idx, amps, wave):
     a_t = gpu.upload(amps.transpose(1, 0, 2), torch.float32)  # (E, 2, k)
     att_t = gpu.upload(att, torch.float32)
     pos_t = gpu.upload(i0[None] + d_int)  # (2, E)
-    for s in range(0, E, bs):
-        e = slice(s, s + bs)
-        y = torch.bmm(a_t[e], wave[idx_t[e]])  # (b, 2, k) @ (b, k, L) -> (b, 2, L)
-        y[:, :, :A] *= (1 - torch.exp(-na[None] / att_t[e][:, None]))[:, None, :]
-        for ear in (0, 1):
-            buf[ear].index_add_(0, (pos_t[ear, e][:, None] + nl[None]).reshape(-1), y[:, ear].reshape(-1))
+
+    def run(buf):
+        dev = buf.device
+        na = torch.arange(A, device=dev, dtype=torch.float32) / SR
+        nl = torch.arange(L, device=dev)
+        for s in range(0, E, bs):
+            e = slice(s, s + bs)
+            y = torch.bmm(a_t[e], wave[idx_t[e]])  # (b, 2, k) @ (b, k, L) -> (b, 2, L)
+            y[:, :, :A] *= (1 - torch.exp(-na[None] / att_t[e][:, None]))[:, None, :]
+            for ear in (0, 1):
+                buf[ear].index_add_(0, (pos_t[ear, e][:, None] + nl[None]).reshape(-1), y[:, ear].reshape(-1))
+    return run
+
+
+def render_pool(buf, start, delays, att, idx, amps, wave):
+    """Add drops made of pool members into `buf` (2, N) (see prepare_pool)."""
+    prepare_pool(start, delays, att, idx, amps, wave)(buf)
 
 
 # ------------------------------------------------------------------------------ patches
@@ -762,19 +781,24 @@ class RainScene(Layer):
         # this chunk is interpolated the same way whatever the chunk size.
         while self.gen_until < end + CTRL:
             self._generate_unit()
-        buf = torch.zeros(2, n + self.Lmax + 256, device=self.dev)
-        buf[:, : self.tail.shape[1]] += self.tail
+        # Upload everything first: a copy to the GPU waits for all work queued before it, so
+        # uploading between kernels would make the CPU and GPU take turns.
+        jobs = []
         for i, p in enumerate(self.patches):
             got = self._take_from(self.pending[i], end)
             if got is not None:
                 t, att, delays = got[:3]
                 picks = [(got[3 + 2 * g], got[4 + 2 * g].transpose(1, 0, 2)) for g in range(len(self.pools[i].groups))]
-                self.pools[i].render(buf, t - start, delays.T, att, picks)
+                jobs += self.pools[i].prepare(t - start, delays.T, att, picks)
             if self.banks[i] is not None:
                 got = self._take_from(self.bank_pending[i], end)
                 if got is not None:
                     t, idx, amp = got
-                    self.banks[i].render(buf, t - start, idx, amp)
+                    jobs.append(self.banks[i].prepare(t - start, idx, amp))
+        buf = torch.zeros(2, n + self.Lmax + 256, device=self.dev)
+        buf[:, : self.tail.shape[1]] += self.tail
+        for job in jobs:
+            job(buf)
         # The GPU works through what was just queued; meanwhile prepare the next chunk's
         # drops (assuming the same size), which is what the CPU would otherwise do later.
         while self.gen_until < end + n + CTRL:

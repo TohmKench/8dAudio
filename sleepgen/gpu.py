@@ -99,14 +99,13 @@ def fft_rate() -> float:
 
 
 def upload(a, dtype=None):
-    """A numpy array as a tensor on the compute device. On a CUDA/ROCm GPU the copy goes
-    through pinned memory without waiting, so the CPU can queue more work while the GPU
-    is busy (a plain copy from ordinary memory waits for everything queued before it)."""
+    """A numpy array as a tensor on the compute device.
+
+    A plain copy: it waits for the GPU work queued before it, so callers upload everything
+    they need before queueing kernels. (Asynchronous copies from pinned memory crashed
+    kernels with AMD's ROCm build on Windows, and pinning is slow there.)"""
     torch = _torch()
     t = torch.from_numpy(np.ascontiguousarray(a))
     if dtype is not None:
         t = t.to(dtype)
-    d = device()
-    if d.type == "cuda":
-        return t.pin_memory().to(d, non_blocking=True)
-    return t.to(d)
+    return t.to(device())
