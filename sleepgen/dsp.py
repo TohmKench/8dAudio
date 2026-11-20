@@ -142,6 +142,54 @@ def soft_limit(x: np.ndarray, threshold: float = 0.6, ceiling: float = 0.89) -> 
     return y
 
 
+class Convolver:
+    """Streaming FFT convolution (overlap-add) of (frames, channels) blocks with a fixed
+    impulse response `h`, shaped (taps,) for every channel or (taps, channels).
+
+    On a GPU the transforms run there (in float32, transferred in and out per block),
+    which takes long reverbs and filters off the CPU; on a CPU it uses scipy in float64.
+    """
+
+    def __init__(self, h, channels: int = 2):
+        self.h = np.asarray(h, dtype=np.float64)
+        self.taps = len(self.h)
+        self.channels = channels
+        self._spec = {}
+        self._gpu = None
+        try:
+            from . import gpu
+            if gpu.is_gpu():
+                self._gpu = gpu
+        except Exception:  # pragma: no cover - no torch: stay on the CPU
+            self._gpu = None
+        if self._gpu is None:
+            self.tail = np.zeros((self.taps - 1, channels))
+        else:
+            torch = self._gpu._torch()
+            self.tail = torch.zeros(self.taps - 1, channels, device=self._gpu.device())
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        n = len(x)
+        size = sp_fft.next_fast_len(n + self.taps - 1, real=True)
+        h = self.h if self.h.ndim == 2 else self.h[:, None]
+        if self._gpu is None:
+            if size not in self._spec:
+                self._spec = {size: sp_fft.rfft(h, size, axis=0)}
+            y = sp_fft.irfft(sp_fft.rfft(x, size, axis=0, workers=-1) * self._spec[size], size, axis=0,
+                             workers=-1)[: n + len(self.tail)]
+            y[: len(self.tail)] += self.tail
+            self.tail = y[n:].copy()
+            return y[:n]
+        torch = self._gpu._torch()
+        if size not in self._spec:
+            self._spec = {size: torch.fft.rfft(self._gpu.upload(h, torch.float32), size, dim=0)}
+        xt = self._gpu.upload(x, torch.float32)
+        y = torch.fft.irfft(torch.fft.rfft(xt, size, dim=0) * self._spec[size], size, dim=0)[: n + len(self.tail)]
+        y[: len(self.tail)] += self.tail
+        self.tail = y[n:].clone()
+        return y[:n].cpu().numpy().astype(np.float64)
+
+
 class Reverb:
     """Streaming stereo convolution reverb with a synthetic, natural-sounding tail.
 
@@ -183,19 +231,10 @@ class Reverb:
         ir = np.concatenate([np.zeros((pre, channels)), ir])
         ir /= np.sqrt(np.sum(ir ** 2) / channels)
         self.ir = ir
-        self.tail = np.zeros((len(ir) - 1, channels))
-        self._spec = {}
+        self.conv = Convolver(ir, channels)
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
-        n = len(x)
-        size = sp_fft.next_fast_len(n + len(self.ir) - 1)
-        if size not in self._spec:
-            self._spec = {size: sp_fft.rfft(self.ir, size, axis=0)}
-        y = sp_fft.irfft(sp_fft.rfft(x, size, axis=0, workers=-1) * self._spec[size], size, axis=0,
-                         workers=-1)[: n + len(self.tail)]
-        y[: len(self.tail)] += self.tail
-        self.tail = y[n:].copy()
-        return y[:n]
+        return self.conv(x)
 
 
 class Leveler:
@@ -249,16 +288,8 @@ class MatchEQ:
         gains = [pts[0][1]] + [g for _, g in pts] + [pts[-1][1]]
         self.h = signal.firwin2(taps, freqs, 10 ** (np.array(gains) / 20), fs=SR)
         self.delay = taps // 2
-        self.tail = np.zeros((taps - 1, channels))
         self.primed = False
-        self._spec = {}
+        self.conv = Convolver(self.h, channels)
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
-        n = len(x)
-        size = sp_fft.next_fast_len(n + len(self.h) - 1)
-        if size not in self._spec:
-            self._spec = {size: sp_fft.rfft(self.h, size)[:, None]}
-        y = sp_fft.irfft(sp_fft.rfft(x, size, axis=0) * self._spec[size], size, axis=0)[: n + len(self.tail)]
-        y[: len(self.tail)] += self.tail
-        self.tail = y[n:].copy()
-        return y[:n]
+        return self.conv(x)

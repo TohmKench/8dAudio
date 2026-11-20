@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -167,13 +169,50 @@ def _ffmpeg_cmd(out_path: str, bitrate: str) -> list[str]:
         ".aac": ["-c:a", "aac", "-b:a", bitrate],
         ".mp3": ["-c:a", "libmp3lame", "-b:a", bitrate],
         ".opus": ["-c:a", "libopus", "-b:a", bitrate],
-        ".flac": ["-c:a", "flac"],
+        ".flac": ["-c:a", "flac", "-sample_fmt", "s16"],
         ".wav": ["-c:a", "pcm_s16le"],
     }.get(ext)
     if codec is None:
         raise ValueError(f"unsupported output type {ext!r} (use .m4a, .mp3, .opus, .flac or .wav)")
     return ["ffmpeg", "-y", "-v", "error", "-f", "f32le", "-ar", str(SR), "-ac", "2", "-i", "pipe:0",
             *codec, out_path]
+
+
+class _Writer:
+    """Writes blocks to a pipe from a background thread (a few blocks of buffering)."""
+
+    def __init__(self, pipe, depth: int = 3):
+        self.pipe = pipe
+        self.q = queue.Queue(maxsize=depth)
+        self.error = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while True:
+            block = self.q.get()
+            if block is None:
+                return
+            if self.error is None:
+                try:
+                    self.pipe.write(block)
+                except OSError as e:  # ffmpeg died; keep draining so put() never blocks
+                    self.error = e
+
+    def put(self, block: bytes):
+        if self.error is not None:
+            raise RuntimeError(f"ffmpeg stopped accepting audio: {self.error}")
+        self.q.put(block)
+
+    def close(self):
+        """Finish writing everything queued."""
+        self.q.put(None)
+        self.thread.join()
+
+    def stop(self):
+        if self.thread.is_alive():
+            self.q.put(None)
+            self.thread.join()
 
 
 def render(recipe: dict, out_path: str, seconds: float, chunk_s: float = 10.0,
@@ -183,6 +222,7 @@ def render(recipe: dict, out_path: str, seconds: float, chunk_s: float = 10.0,
     # Measure loudness on a throwaway copy so the real render starts from t=0
     # (otherwise the first thunder roll etc. would be spent on the measurement).
     measured = Mix(recipe).calibrate()
+    calibrated = time.time()
     mix = Mix(recipe)
     mix.gain = 10 ** ((mix.target - measured) / 20)
     total = int(seconds * SR)
@@ -190,6 +230,9 @@ def render(recipe: dict, out_path: str, seconds: float, chunk_s: float = 10.0,
     fi, fo = int(mix.fade_in * SR), int(mix.fade_out * SR)
     peak = 0.0
     proc = subprocess.Popen(_ffmpeg_cmd(out_path, bitrate), stdin=subprocess.PIPE)
+    # Encoding runs in ffmpeg's own process; a writer thread keeps feeding it, so the next
+    # chunk is synthesised while ffmpeg encodes this one (instead of taking turns).
+    writer = _Writer(proc.stdin)
     try:
         done = 0
         last_report = 0.0
@@ -204,7 +247,7 @@ def render(recipe: dict, out_path: str, seconds: float, chunk_s: float = 10.0,
                 fade = np.minimum(fade, (1 - np.cos(np.pi * np.clip((total - idx) / fo, 0, 1))) / 2)
             x = soft_limit(x * fade[:, None])
             peak = max(peak, float(np.max(np.abs(x))))
-            proc.stdin.write(x.astype(np.float32).tobytes())
+            writer.put(x.astype(np.float32).tobytes())
             done += n
             if progress and (time.time() - last_report > 5 or done == total):
                 last_report = time.time()
@@ -214,11 +257,16 @@ def render(recipe: dict, out_path: str, seconds: float, chunk_s: float = 10.0,
                       end="", file=sys.stderr, flush=True)
         if progress:
             print(file=sys.stderr)
+        writer.close()
     finally:
-        proc.stdin.close()
+        writer.stop()
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
         code = proc.wait()
-    if code != 0:
-        raise RuntimeError(f"ffmpeg exited with code {code}")
+    if code != 0 or writer.error is not None:
+        raise RuntimeError(f"ffmpeg exited with code {code}" + (f" ({writer.error})" if writer.error else ""))
     return {
         "output": out_path,
         "seconds": seconds,
@@ -226,6 +274,7 @@ def render(recipe: dict, out_path: str, seconds: float, chunk_s: float = 10.0,
         "target_lufs": mix.target,
         "peak_dbfs": round(float(20 * np.log10(peak + 1e-12)), 2),
         "render_seconds": round(time.time() - started, 1),
+        "loudness_check_seconds": round(calibrated - started, 1),
     }
 
 

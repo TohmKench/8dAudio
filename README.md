@@ -55,7 +55,8 @@ recipe's `meta` block (theme, headline, features) feeds video titles and the wee
   stays comfortable for someone lying on one ear. Binaural beats are never panned.
 - **Quality over speed.** Rain is built from up to 16,000 individually modelled drops per second on a
   GPU (see below), each with its own size, speed, landing spot and sound. Audio streams to ffmpeg in
-  10 second chunks, so memory stays flat, and output is 384 kbps AAC (YouTube's recommended rate).
+  10 second chunks, so memory stays flat. Output is 384 kbps AAC (`.m4a`, YouTube's recommended rate)
+  or lossless FLAC (`.flac`, 16 bit), which encodes about ten times faster.
 
 ## Rain: physical scenes
 
@@ -80,10 +81,15 @@ What is modelled:
   click of contact, plus whatever the surface does next. Water traps a small bubble that rings
   (Minnaert frequency) with a rising chirp; leaves and tiles give a short woody or stony ring.
   Metal sheets, window panes and tent fabric are split into panels, each with its own vibration modes,
-  and a drop excites each mode by how its shape moves at the landing point. Because a sheet's modes are
-  fixed, each panel's response is worked out once per landing spot and drop size (heard from the
-  panel's centre, since a ringing sheet radiates from its whole surface), and each drop then adds a
-  scaled copy: many times faster than synthesising every mode for every drop.
+  and a drop excites each mode by how its shape moves at the landing point.
+- **Fast without shortcuts in the sound.** Every surface's resonances come from large pools rendered
+  once, and each drop strikes its own few members with its own strengths per ear (thousands of members
+  per band, closer together than the ear can tell apart). A sheet's modes are fixed, so each panel is a
+  bank of resonators heard from its centre (a ringing sheet radiates from its whole surface). Long rings
+  are rendered as FFT filter banks: a drop only places one impulse per resonance it strikes, and each
+  resonance's impulses are convolved with its response in blocks. The cost then depends on how many
+  resonances there are, not on how many drops hit them. Copying every drop's ring into the soundtrack
+  was the limit before (the GPU tops out at about 3 billion additions a second).
 - **Space.** Every drop has a position in 3D. Its sound reaches each ear with the right delay, level,
   head shadow, distance loss and air absorption, and through a ceiling, wall or glass where there is
   one. All of it shares a small room or outdoor reverb. Listen on headphones.
@@ -140,9 +146,16 @@ On Windows with an AMD Radeon RX 9000 card (e.g. the RX 9060 XT), either:
 2. **DirectML, fallback.** `pip install torch-directml` (it installs the PyTorch version it needs).
    Works with any DirectX 12 GPU, usually slower than ROCm.
 
-Check it with `python -m sleepgen bench`, which renders a little rain in every environment and
-projects how long a 10 hour video takes. Force a device with `--device cuda` / `directml` / `cpu`
+Check it with `python -m sleepgen bench`, which renders a little rain in every environment and fire in
+every setting, and projects how long a 10 hour video takes. `bench --full flac --seconds 300` times the
+whole pipeline (master chain and encoding too). Force a device with `--device cuda` / `directml` / `cpu`
 (or `SLEEPGEN_DEVICE`).
+
+What runs where: drops, sheets and fire crackles are synthesised on the GPU, and so are the long
+convolutions (room and master reverbs, the rain's background bed, the fire's roar and hiss). The CPU
+prepares the next chunk's drops while the GPU renders the current one, and ffmpeg encodes on its own
+CPU core from a queue, so encoding and rendering run side by side. On a 6-core CPU two renders at once
+use the machine best.
 
 ## Sound library (optional)
 

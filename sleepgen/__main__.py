@@ -8,7 +8,8 @@
   python -m sleepgen previews -d previews --seconds 90
   python -m sleepgen previews --rain --rate 4 -d previews      (rain in every environment)
   python -m sleepgen previews --fire -d previews               (fire in every setting)
-  python -m sleepgen bench                                     (GPU speed check)
+  python -m sleepgen bench                                     (GPU speed check, synthesis only)
+  python -m sleepgen bench --full flac --seconds 300           (whole pipeline incl. encoding)
 """
 
 from __future__ import annotations
@@ -77,9 +78,11 @@ def main(argv=None) -> int:
     pv.add_argument("--fire", action="store_true", help="one clip of fire in every setting instead")
     pv.add_argument("--intensity", type=float, help="with --fire: 0.5 gentle .. 1.3 roaring (default: random)")
 
-    bn = sub.add_parser("bench", help="time rain rendering on this machine and project a 10 hour render")
+    bn = sub.add_parser("bench", help="time rain/fire rendering on this machine and project a 10 hour render")
     bn.add_argument("--seconds", type=float, default=20)
-    bn.add_argument("--environment", action="append")
+    bn.add_argument("--environment", action="append", help="rain environments or fire settings (default: all)")
+    bn.add_argument("--full", choices=["flac", "m4a"],
+                    help="time the whole pipeline (loudness, master chain, encoding) to a temporary file")
 
     mt = sub.add_parser("match", help="tune a base sound to match a reference recording")
     mt.add_argument("reference")
@@ -95,26 +98,43 @@ def main(argv=None) -> int:
         gpu.set_device(args.device)
 
     if args.cmd == "bench":
+        import tempfile
         import time
         import numpy as np
         from . import gpu
         from .dsp import SR
+        from .fire import FIRE_ENVIRONMENTS, FireScene
         from .scene import ENVIRONMENTS, RainScene
-        print(f"device: {gpu.describe()}   drops/s budget: {gpu.default_budget()}")
+        print(f"device: {gpu.describe()}   drops/s budget: {gpu.default_budget()}"
+              + (f"   whole pipeline to .{args.full}" if args.full else "   synthesis only"))
         worst = 0.0
-        for env in args.environment or list(ENVIRONMENTS):
-            t = time.time()
-            s = RainScene(np.random.default_rng(1), environment=env, rain_mm_h=6.0)
-            t_init = time.time() - t
-            t = time.time()
-            for _ in range(int(args.seconds // 10)):
-                s(SR * 10)
-            spent = time.time() - t
-            per_hour = spent / (args.seconds // 10 * 10) * 3600
+        for env in args.environment or list(ENVIRONMENTS) + list(FIRE_ENVIRONMENTS):
+            fire = env in FIRE_ENVIRONMENTS
+            if args.full:
+                recipe = random_recipe(1, "fire" if fire else "rain", None, secondaries=[], accents=[])
+                recipe["layers"][0]["params"]["environment"] = env
+                if not fire:
+                    recipe["layers"][0]["params"]["rain_mm_h"] = 6.0
+                with tempfile.TemporaryDirectory() as tmp:
+                    from .engine import render
+                    rep = render(recipe, os.path.join(tmp, f"bench.{args.full}"), args.seconds, progress=False)
+                    # The loudness check (120 s, once per video) is left out: it is 0.3% of 10 h.
+                    spent, t_init = rep["render_seconds"] - rep["loudness_check_seconds"], 0.0
+            else:
+                t = time.time()
+                s = FireScene(np.random.default_rng(1), environment=env) if fire else \
+                    RainScene(np.random.default_rng(1), environment=env, rain_mm_h=6.0)
+                t_init = time.time() - t
+                t = time.time()
+                for _ in range(int(args.seconds // 10)):
+                    s(SR * 10)
+                spent = time.time() - t
+            secs = args.seconds if args.full else args.seconds // 10 * 10
+            per_hour = spent / secs * 3600
             worst = max(worst, per_hour)
-            print(f"{env:9s} {args.seconds / spent:6.1f}x realtime   10 h would take {per_hour * 10 / 60:6.1f} min"
-                  f"   (setup {t_init:.1f}s)")
-        print(f"slowest environment: 10 h in about {worst * 10 / 60:.0f} min")
+            print(f"{env:10s} {secs / spent:6.1f}x realtime   10 h would take {per_hour * 10 / 60:6.1f} min"
+                  + ("" if args.full else f"   (setup {t_init:.1f}s)"), flush=True)
+        print(f"slowest: 10 h in about {worst * 10 / 60:.0f} min")
         return 0
 
     if args.cmd == "match":

@@ -3,9 +3,16 @@
 A scene is a set of *patches* (a roof above you, a window to one side, a lake in
 front, a forest canopy overhead). Each second, every patch receives the number and
 sizes of drops that real rain at the current rainfall rate would deliver to its area.
-Each drop is synthesised individually on the GPU from its own physical properties
-(see surfaces.py) and placed in 3D: its distance sets level and air absorption, and
-its direction sets the delay and head-shadow at each ear, so it is heard where it lands.
+Each drop is modelled individually from its own physical properties (see surfaces.py)
+and placed in 3D: its distance sets level and air absorption, and its direction sets the
+delay and head-shadow at each ear, so it is heard where it lands.
+
+Rendering is built for speed on the GPU without changing what a drop is. Each surface's
+resonances are drawn from large pools rendered once (DropPool), and a drop strikes its
+own few members, each with its own strength per ear. Sheets (metal, glass, fabric) are
+banks of fixed per-panel resonators (PlateBank). Long rings are rendered as FFT filter
+banks (FilterBank): a drop places one impulse per resonance it excites, so the cost
+depends on the number of resonances rather than the number of drops.
 
 There are far more drops than any machine could render one by one (a lake gets
 millions per second), so the loudest ones nearby are synthesised individually, up to
@@ -28,9 +35,9 @@ from scipy import signal
 
 from . import gpu
 from . import rainphys as P
-from .dsp import SR, Reverb, rms
+from .dsp import SR, Convolver, Reverb, rms
 from .layers import Layer, child
-from .surfaces import SHORT_L, SIZE_BINS, SPOTS, Modes, Plate, make_surface, size_bin
+from .surfaces import FLOOR_DB, SHORT_L, SIZE_BINS, Modes, Plate, _attack, make_surface, size_bin
 
 CTRL = SR // 10  # rain-rate / wind resolution: 0.1 s
 UNIT = SR        # drops are generated in fixed 1 s units, so output never depends on chunk size
@@ -68,7 +75,7 @@ def _render(buf, start, delays, amps, modes: Modes, L: int):
     bs = max(1, gpu.batch_elements() // (M * L))
 
     def T(a):
-        return torch.as_tensor(np.ascontiguousarray(a), device=dev, dtype=torch.float32)
+        return gpu.upload(a, torch.float32)
 
     # The interaural delay is applied as a whole-sample offset per ear (<= 21 us error),
     # so each drop's modes are computed once and shared by both ears.
@@ -83,26 +90,116 @@ def _render(buf, start, delays, amps, modes: Modes, L: int):
         g = torch.exp(-x / tau[:, :, None]) * torch.sin(2 * np.pi * f[:, :, None] * (x + 0.5 * ch[:, :, None] * x * x)
                                                        + ph[:, :, None])
         env = (1 - torch.exp(-tt / att[:, None])) * taper
-        base = torch.as_tensor(i0.astype(np.int64), device=dev)
+        base = gpu.upload(i0.astype(np.int64))
         for ear in (0, 1):
             y = torch.einsum("bm,bml->bl", T(amps[ear][e]), g) * env
-            idx = (base + torch.as_tensor(d_int[ear][e], device=dev))[:, None] + nl[None, :]
+            idx = (base + gpu.upload(d_int[ear][e]))[:, None] + nl[None, :]
             buf[ear].index_add_(0, idx.reshape(-1), y.reshape(-1))
 
 
-class PlateBank:
-    """Precomputed responses of a panelled sheet (metal roofing, glass, tent fabric).
+class FilterBank:
+    """Drops rendered as impulses into a bank of fixed responses, by FFT convolution.
 
-    A sheet's vibration modes are fixed, so instead of synthesising every mode for every
-    drop, each (panel, landing spot, drop-size class) gets its response computed once:
-    the panel's modes as excited at that spot, heard from the panel's centre (a ringing
-    sheet radiates from its whole surface, not from the point that was hit) with the
-    right delay, head shadow, distance and air loss at each ear. A drop then costs one
-    scaled copy of its response, which is many times faster than synthesising it.
+    Copying each drop's whole response into the soundtrack costs one addition per sample
+    per drop, and on the GPU those additions are the limit (about 3 billion per second,
+    whatever the layout). Here a drop only places one impulse for each resonance it
+    excites. Each resonance's impulse train is then convolved with its response in blocks,
+    with FFTs, so the cost depends on how many resonances there are, not on how many drops
+    hit them: more drops cost almost nothing extra.
+
+    waves   (R, Lw) tensor: each resonance's response
+    gains   optional (P, 2, K) fixed gain per ear for R = P x K resonances in P groups of K
+            (a sheet's panels, heard from each panel's centre), with `delays` (2, P): each
+            group's whole-sample delay per ear. Without them, every impulse carries its own
+            per-ear amplitude and position.
+    """
+
+    def __init__(self, waves, dev, gains=None, delays=None):
+        torch = gpu._torch()
+        R, Lw = waves.shape
+        self.R = R
+        dmax = 0 if delays is None else int(np.max(delays))
+        self.nfft = sp_fft.next_fast_len(max(8192, 6 * (Lw + dmax)), real=True)
+        self.Nb = self.nfft - Lw - dmax  # impulse positions covered per block
+        self.W = torch.fft.rfft(waves, n=self.nfft, dim=1)  # (R, F)
+        if gains is None:
+            self.C = 2
+        else:
+            self.C = 1
+            F = self.W.shape[1]
+            self.P, _, self.K = gains.shape
+            self.G = torch.as_tensor(np.asarray(gains, np.float32), device=dev).to(self.W.dtype)
+            w = torch.arange(F, device=dev, dtype=torch.float32) * (2 * np.pi / self.nfft)
+            d = torch.as_tensor(np.asarray(delays, np.float32).T, device=dev)  # (P, 2)
+            self.phase = torch.polar(torch.ones(self.P, 2, F, device=dev), -d[:, :, None] * w[None, None])
+
+    @property
+    def span(self):
+        """Samples past the last impulse position that a render can write into."""
+        return self.nfft
+
+    def render(self, buf, pos, member, amp):
+        """pos (C, Q) whole-sample positions in `buf` (2, N); member (Q,); amp (C, Q)."""
+        torch = gpu._torch()
+        if pos.shape[1] == 0:
+            return
+        dev = buf.device
+        C, R, nfft, Nb = self.C, self.R, self.nfft, self.Nb
+        blk = pos // Nb
+        flat = (np.arange(C)[:, None] * R + member[None]) * nfft + (pos - blk * Nb)
+        blk, flat, a = blk.ravel(), flat.ravel(), amp.ravel()
+        order = np.argsort(blk, kind="stable")
+        blk, flat, a = blk[order], flat[order], a[order]
+        bounds = np.searchsorted(blk, np.arange(blk[-1] + 2))
+        flat_t = gpu.upload(flat)
+        a_t = gpu.upload(a, torch.float32)
+        x = torch.zeros(C * R * nfft, device=dev)
+        F = nfft // 2 + 1
+        rc = max(1, (1 << 23) // (2 * F))  # resonances per multiply-and-sum step (bounded temporaries)
+        for b in np.flatnonzero(np.diff(bounds)):
+            lo, hi = int(bounds[b]), int(bounds[b + 1])
+            x.zero_()
+            x.index_add_(0, flat_t[lo:hi], a_t[lo:hi])
+            X = torch.fft.rfft(x.view(C, R, nfft), dim=2)
+            if C == 1:  # per panel: weight each mode per ear, then delay each panel per ear
+                Z = torch.bmm(self.G, (X[0] * self.W).view(self.P, self.K, F))  # (P, 2, F)
+                Y = (Z * self.phase).sum(0)
+            else:
+                Y = torch.zeros(2, F, dtype=X.dtype, device=dev)
+                for r0 in range(0, R, rc):
+                    Y += (X[:, r0:r0 + rc] * self.W[r0:r0 + rc]).sum(1)
+            s = int(b) * Nb
+            buf[:, s:s + nfft] += torch.fft.irfft(Y, nfft, dim=1)
+
+
+def _wave(dev, f, tau, L, ph, chirp=None, att=None):
+    """Decaying resonances (R,) rendered to (R, L), with the end tapered to zero."""
+    torch = gpu._torch()
+
+    def T(a):
+        return torch.as_tensor(np.asarray(a, np.float32), device=dev)[:, None]
+
+    n = torch.arange(L, device=dev, dtype=torch.float32)
+    x = (n / SR)[None]
+    arg = x if chirp is None else x + 0.5 * T(chirp) * x * x
+    w = torch.exp(-x / T(tau)) * torch.sin(2 * np.pi * T(f) * arg + T(ph))
+    w = w * torch.clamp((L - n) / (0.12 * L), max=1.0)
+    if att is not None:
+        w = w * (1 - torch.exp(-x / T(att)))
+    return w
+
+
+class PlateBank:
+    """A panelled sheet (metal roofing, glass, tent fabric) as a bank of resonators.
+
+    A sheet's vibration modes are fixed, so each panel's modes (and its low boom) are
+    resonators heard from the panel's centre (a ringing sheet radiates from its whole
+    surface, not from the point that was hit), with the right delay, head shadow,
+    distance and air loss at each ear. A drop strikes the modes its landing spot and size
+    excite (precomputed per panel, spot and size class), each with its own strength.
     """
 
     def __init__(self, patch, surf: Plate, dev, rng):
-        torch = gpu._torch()
         s, c = np.asarray(patch.size, float), np.asarray(patch.center, float)
         axes = np.argsort(-s)[:2]
         centres = []
@@ -112,69 +209,132 @@ class PlateBank:
             uvw[axes[0]], uvw[axes[1]] = (iu + 0.5) / surf.nu, (iv + 0.5) / surf.nv
             centres.append(c + (uvw - 0.5) * s)
         v_bins = P.fall_velocity(SIZE_BINS, patch.fall_height)
-        f, tau, amp, attack = surf.bank_modes(v_bins, rng)  # (Pn, S, B, M)
+        self.idx, self.amp = surf.bank_modes(v_bins, rng)  # (Pn, S, B, m)
+        f, tau, ok = surf.resonators()  # (Pn, K)
+        Pn, K = f.shape
+        self.K = K
+        self.n_spots, self.n_sizes = self.idx.shape[1], self.idx.shape[2]
         r, dl, dr, th_l, th_r = P.ear_geometry(np.array(centres))
-        ex = (slice(None), None, None, None)
-        common = amp * P.air_absorption(f, r[ex]) / r[ex] * patch.path_gain(f)
-        amps = np.stack([common * P.head_shadow(f, th_l[ex]), common * P.head_shadow(f, th_r[ex])])
+        common = P.air_absorption(f, r[:, None]) / r[:, None] * patch.path_gain(f) * ok
+        gains = np.stack([common * P.head_shadow(f, th_l[:, None]), common * P.head_shadow(f, th_r[:, None])], axis=1)
         delays = np.round(np.stack([dl, dr])).astype(int)  # (2, Pn)
-        Pn, S, B, M = f.shape
-        L = surf.L
-        self.L = L + int(delays.max()) + 1
-        self.n_spots, self.n_sizes = S, B
-        n = torch.arange(L, device=dev, dtype=torch.float32)
-        taper = torch.clamp((L - n) / (0.12 * L), max=1.0)
-        kern = torch.zeros(Pn * S * B, 2, self.L, device=dev)
-        rows = Pn * S * B
-        fl, tl = f.reshape(rows, M), tau.reshape(rows, M)
-        # Each response starts its modes at their own phase (as the per-drop path does), so
-        # the onset has the same bite.
-        phl = rng.uniform(0, 2 * np.pi, (rows, M))
-        al = amps.reshape(2, rows, M)
-        att = np.broadcast_to(attack[None, None, :], (Pn, S, B)).reshape(rows)
-        panel = np.repeat(np.arange(Pn), S * B)
-        bs = max(1, gpu.batch_elements() // (M * L))
+        d_typ = np.mean(patch.fixed_d) if patch.fixed_d else 1.5
+        att = float(_attack(np.array([d_typ]), P.fall_velocity(np.array([d_typ]), patch.fall_height))[0])
+        waves = _wave(dev, f.ravel(), tau.ravel(), surf.L, rng.uniform(0, 2 * np.pi, Pn * K),
+                      att=np.full(Pn * K, att))
+        self.bank = FilterBank(waves, dev, gains, delays)
 
-        def T(a):
-            return torch.as_tensor(np.ascontiguousarray(a), device=dev, dtype=torch.float32)
+    def strikes(self, panel, spot, size, strength):
+        """Resonators (E, m) each drop strikes and the strength of each strike."""
+        idx = self.idx[panel, spot, size] + (panel * self.K)[:, None]
+        return idx, self.amp[panel, spot, size] * strength[:, None]
 
-        x = n / SR
-        for a in range(0, rows, bs):
-            e = slice(a, a + bs)
-            g = torch.exp(-x / T(tl[e])[:, :, None]) * torch.sin(2 * np.pi * T(fl[e])[:, :, None] * x
-                                                                 + T(phl[e])[:, :, None])
-            env = (1 - torch.exp(-x[None] / T(att[e])[:, None])) * taper
-            for ear in (0, 1):
-                y = torch.einsum("bm,bml->bl", T(al[ear][e]), g) * env
-                for p in np.unique(panel[e]):
-                    sel = np.flatnonzero(panel[e] == p)
-                    off = int(delays[ear, p])
-                    kern[a + sel, ear, off:off + L] = y[torch.as_tensor(sel, device=dev)]
-        self.kern = kern
-
-    def index(self, panel, spot, size):
-        return (panel * self.n_spots + spot) * self.n_sizes + size
+    def render(self, buf, start, idx, amp):
+        E, m = idx.shape
+        pos = np.repeat(np.round(start).astype(np.int64), m)[None]
+        self.bank.render(buf, pos, idx.ravel(), amp.ravel()[None])
 
 
-def render_bank(buf, start, kidx, gains, bank: PlateBank):
-    """Add one scaled copy of each drop's precomputed response into `buf` (2, N)."""
+class DropPool:
+    """Pre-rendered resonances for one surface's per-drop sound (surfaces.Burst, Ring, Bubble).
+
+    Each part of the sound gets a pool of single decaying resonances drawn from the same
+    distribution the drops would draw from, rendered once. A drop picks its own members
+    of each pool and gives each a strength per ear (from its frequency, the drop's size and
+    speed, distance, air loss and head shadow, exactly as a freshly synthesised drop
+    would). The parts are grouped by how long they ring: the clicks (SHORT_L samples) and
+    everything else (the surface's L). Each group is rendered whichever way is cheaper on
+    this device for the expected number of drops: as weighted copies of the members
+    (cheap for short clicks; keeps each drop's own attack), or as an FFT filter bank.
+    """
+
+    DIRECT_SIZE = 2048  # members per part when copied per drop (more variety costs nothing)
+
+    def __init__(self, surf, dev, rng, drops_per_s, att):
+        self.parts = surf.parts
+        self.info = [None] * len(surf.parts)
+        self.groups = []  # (part indices, member offsets, waves (J, L), FilterBank or None)
+        kf = FLOOR_DB / 8.686
+        for short in (True, False):
+            ids = [i for i, p in enumerate(surf.parts) if p.short == short]
+            if not ids:
+                continue
+            L = SHORT_L if short else surf.L
+            # Estimated cost per second of audio, each way.
+            n_fft = sum(surf.parts[i].members for i in ids)
+            nfft = sp_fft.next_fast_len(max(8192, 6 * L), real=True)
+            fft_cost = 2 * n_fft * SR * nfft / (nfft - L) / gpu.fft_rate()
+            direct_cost = drops_per_s * 2 * L / gpu.scatter_rate()
+            use_fft = fft_cost < direct_cost
+            for i in ids:
+                self.info[i] = surf.parts[i].pool(rng, surf.parts[i].members if use_fft else self.DIRECT_SIZE)
+            pools = [self.info[i] for i in ids]
+            offsets = np.cumsum([0] + [len(q["f"]) for q in pools[:-1]])
+            f = np.concatenate([q["f"] for q in pools])
+            tau = np.minimum(np.concatenate([q["tau"] for q in pools]), L / (kf * SR))
+            chirp = np.concatenate([q.get("chirp", np.zeros(len(q["f"]))) for q in pools])
+            ph = rng.uniform(0, 2 * np.pi, len(f))
+            if use_fft:  # the attack is baked in (it barely matters for these longer rings)
+                waves = _wave(dev, f, tau, L, ph, chirp, att=np.full(len(f), att))
+                self.groups.append((ids, offsets, waves, FilterBank(waves, dev)))
+            else:
+                self.groups.append((ids, offsets, _wave(dev, f, tau, L, ph, chirp), None))
+
+    @property
+    def span(self):
+        return max(fb.span if fb is not None else w.shape[1] for _, _, w, fb in self.groups)
+
+    def pick(self, rng, d, v):
+        """For drops (d, v): per group, pool members (E, k), amplitudes (E, k) and their
+        frequencies (E, k)."""
+        out = []
+        for ids, offsets, _, _ in self.groups:
+            idx, amp, f = [], [], []
+            for i, off in zip(ids, offsets):
+                j, a = self.parts[i].pick(rng, d, v, self.info[i])
+                idx.append(j + off), amp.append(a), f.append(self.info[i]["f"][j])
+            out.append((np.concatenate(idx, axis=1), np.concatenate(amp, axis=1), np.concatenate(f, axis=1)))
+        return out
+
+    def render(self, buf, start, delays, att, picks):
+        """start (E,), delays (2, E) samples, att (E,) s; picks: per group (idx (E, k), amps (2, E, k))."""
+        for (_, _, wave, fb), (idx, amps) in zip(self.groups, picks):
+            if fb is None:
+                render_pool(buf, start, delays, att, idx, amps, wave)
+            else:
+                E, k = idx.shape
+                pos = np.repeat(np.round(start).astype(np.int64)[None] + np.round(delays).astype(np.int64), k, axis=1)
+                fb.render(buf, pos, idx.ravel(), amps.reshape(2, -1))
+
+
+def render_pool(buf, start, delays, att, idx, amps, wave):
+    """Add drops made of pool members into `buf` (2, N).
+
+    start (E,) onset in samples relative to buf[0]; delays (2, E) per-ear delay in samples;
+    att (E,) attack time (s); idx (E, k) members of `wave` (J, L); amps (2, E, k).
+    """
     torch = gpu._torch()
-    E = len(kidx)
+    E, k = idx.shape
     if E == 0:
         return
     dev = buf.device
-    L = bank.L
+    L = wave.shape[1]
+    A = min(L, 96)  # the attack (<= 0.3 ms) is over well within 96 samples
+    na = torch.arange(A, device=dev, dtype=torch.float32) / SR
     nl = torch.arange(L, device=dev)
-    i0 = torch.as_tensor(np.round(start).astype(np.int64), device=dev)
-    bs = max(1, gpu.batch_elements() // (4 * L))
-    k_all = torch.as_tensor(kidx, device=dev)
-    g_all = torch.as_tensor(gains, device=dev, dtype=torch.float32)
+    i0 = np.round(start).astype(np.int64)
+    d_int = np.round(delays).astype(np.int64)
+    bs = max(1, gpu.batch_elements() // (k * L + 2 * L))
+    idx_t = gpu.upload(idx)
+    a_t = gpu.upload(amps.transpose(1, 0, 2), torch.float32)  # (E, 2, k)
+    att_t = gpu.upload(att, torch.float32)
+    pos_t = gpu.upload(i0[None] + d_int)  # (2, E)
     for s in range(0, E, bs):
         e = slice(s, s + bs)
-        y = bank.kern[k_all[e]] * g_all[e][:, None, None]  # (b, 2, L)
-        idx = (i0[e][:, None] + nl[None, :]).reshape(-1)
+        y = torch.bmm(a_t[e], wave[idx_t[e]])  # (b, 2, k) @ (b, k, L) -> (b, 2, L)
+        y[:, :, :A] *= (1 - torch.exp(-na[None] / att_t[e][:, None]))[:, None, :]
         for ear in (0, 1):
-            buf[ear].index_add_(0, idx, y[:, ear].reshape(-1))
+            buf[ear].index_add_(0, (pos_t[ear, e][:, None] + nl[None]).reshape(-1), y[:, ear].reshape(-1))
 
 
 # ------------------------------------------------------------------------------ patches
@@ -355,23 +515,8 @@ ENVIRONMENTS = {
 
 # --------------------------------------------------------------------------- diffuse
 
-class _FIR:
+class _FIR(Convolver):
     """Streaming FIR (overlap-add) on stereo numpy blocks."""
-
-    def __init__(self, h):
-        self.h = h
-        self.tail = np.zeros((len(h) - 1, 2))
-        self._spec = {}
-
-    def __call__(self, x):
-        n = len(x)
-        size = sp_fft.next_fast_len(n + len(self.h) - 1)
-        if size not in self._spec:
-            self._spec = {size: sp_fft.rfft(self.h, size)[:, None]}
-        y = sp_fft.irfft(sp_fft.rfft(x, size, axis=0) * self._spec[size], size, axis=0)[: n + len(self.tail)]
-        y[: len(self.tail)] += self.tail
-        self.tail = y[n:].copy()
-        return y[:n]
 
 
 # ----------------------------------------------------------------------------- scene
@@ -420,11 +565,24 @@ class RainScene(Layer):
         weights = sum(p.weight for p in self.patches if p.individual and p.fixed_rate is None)
         self.share = [p.weight / weights * self.budget if (p.individual and p.fixed_rate is None) else 0.0
                       for p in self.patches]
-        # Panelled sheets ring from a precomputed bank; only their contact clicks are per drop.
+        # Every drop is made from pre-rendered pools of resonances (DropPool), and panelled
+        # sheets ring from a precomputed bank of whole responses (PlateBank).
         bank_rng = child(rng)
         self.banks = [PlateBank(p, s, self.dev, bank_rng) if isinstance(s, Plate) and p.individual else None
                       for p, s in zip(self.patches, self.surfaces)]
-        self.Lmax = max([s.L for s in self.surfaces] + [b.L for b in self.banks if b is not None])
+        pool_rng = child(rng)
+        self.pools = []
+        for i, (p, s) in enumerate(zip(self.patches, self.surfaces)):
+            if not p.individual:
+                self.pools.append(None)
+                continue
+            rate = p.fixed_rate if p.fixed_rate is not None else self.share[i]
+            d_typ = np.mean(p.fixed_d) if p.fixed_d else 1.5
+            att = float(_attack(np.array([d_typ]), P.fall_velocity(np.array([d_typ]), p.fall_height))[0])
+            self.pools.append(DropPool(s, self.dev, pool_rng, rate, att))
+        # Room past the end of each chunk for what drops near its end write (carried over).
+        self.Lmax = max([s.L for s in self.surfaces] + [x.span + 64 for x in self.pools if x is not None]
+                        + [b.bank.span + 64 for b in self.banks if b is not None])
         self.room = None
         if env.get("room"):
             r = env["room"]
@@ -491,24 +649,32 @@ class RainScene(Layer):
         return m, delays, amps
 
     def _spatial(self, i, m, pos):
-        p = self.patches[i]
-        r, dl, dr, th_l, th_r = P.ear_geometry(pos)
-        common = m.amp * P.air_absorption(m.f, r[:, None]) / r[:, None] * p.path_gain(m.f)
-        amps = np.stack([common * P.head_shadow(m.f, th_l[:, None]), common * P.head_shadow(m.f, th_r[:, None])])
-        return np.stack([dl, dr]), amps
+        geo = P.ear_geometry(pos)
+        return np.stack(geo[1:3]), self._ear_amps(i, m.amp, m.f, geo)
 
-    def _take_bank(self, i, end):
+    def _ear_amps(self, i, amp, f, geo):
+        """Per-ear amplitudes (2, E, k) of modes (E, k) heard from drops at `geo`."""
+        r, _, _, th_l, th_r = geo
+        common = amp * P.air_absorption(f, r[:, None]) / r[:, None] * self.patches[i].path_gain(f)
+        return np.stack([common * P.head_shadow(f, th_l[:, None]), common * P.head_shadow(f, th_r[:, None])])
+
+    @staticmethod
+    def _take_from(pending, end):
+        """Pop the drops in `pending` (tuples of arrays, events on axis 0) that start before `end`."""
         keep, out = [], []
-        for t, k, g in self.bank_pending[i]:
-            sel = t < end
-            if sel.any():
-                out.append((t[sel], k[sel], g[sel]))
-            if not sel.all():
-                keep.append((t[~sel], k[~sel], g[~sel]))
-        self.bank_pending[i] = keep
+        for item in pending:
+            sel = item[0] < end
+            if sel.all():
+                out.append(item)
+            elif sel.any():
+                out.append(tuple(a[sel] for a in item))
+                keep.append(tuple(a[~sel] for a in item))
+            else:
+                keep.append(item)
+        pending[:] = keep
         if not out:
             return None
-        return tuple(np.concatenate([o[j] for o in out]) for j in range(3))
+        return tuple(np.concatenate([o[j] for o in out]) for j in range(len(out[0])))
 
     # -- generation in fixed 1 s units ------------------------------------------------
     def _generate_unit(self):
@@ -539,38 +705,16 @@ class RainScene(Layer):
             if times:
                 d, v, pos, uv = (np.concatenate(a) for a in (ds, vs, poss, uvs))
                 t = np.concatenate(times)
+                geo = P.ear_geometry(pos)
+                item = [t, _attack(d, v), np.stack(geo[1:3], axis=1)]  # events on axis 0
+                for idx, amp, f in self.pools[i].pick(rng, d, v):
+                    item += [idx, self._ear_amps(i, amp, f, geo).transpose(1, 0, 2)]
+                self.pending[i].append(tuple(item))
                 if self.banks[i] is not None:
-                    surf = self.surfaces[i]
-                    m = surf.click_modes(rng, d, v)
-                    delays, amps = self._spatial(i, m, pos)
-                    self.pending[i].append((t, m, delays, amps))
-                    panel, spot = surf.locate(uv)
-                    kidx = self.banks[i].index(panel, spot, size_bin(d))
-                    self.bank_pending[i].append((t, kidx, P.impact_strength(d, v)))
-                else:
-                    m, delays, amps = self._voice(rng, i, d, v, pos, uv)
-                    self.pending[i].append((t, m, delays, amps))
+                    panel, spot = self.surfaces[i].locate(uv)
+                    idx, amp = self.banks[i].strikes(panel, spot, size_bin(d), P.impact_strength(d, v))
+                    self.bank_pending[i].append((t, idx, amp))
         self.gen_until += UNIT
-
-    def _take(self, i, end):
-        """Pop pending drops on patch i that start before `end`."""
-        keep, out = [], []
-        for t, m, dl, am in self.pending[i]:
-            sel = t < end
-            if sel.all():
-                out.append((t, m, dl, am))
-            elif sel.any():
-                out.append((t[sel], _sub(m, sel), dl[:, sel], am[:, sel]))
-                keep.append((t[~sel], _sub(m, ~sel), dl[:, ~sel], am[:, ~sel]))
-            else:
-                keep.append((t, m, dl, am))
-        self.pending[i] = keep
-        if not out:
-            return None
-        t = np.concatenate([o[0] for o in out])
-        m = Modes(*(np.concatenate([getattr(o[1], k) for o in out]) for k in ("f", "tau", "amp", "ph", "chirp")),
-                  attack=np.concatenate([o[1].attack for o in out]), n_short=out[0][1].n_short)
-        return t, m, np.concatenate([o[2] for o in out], axis=1), np.concatenate([o[3] for o in out], axis=1)
 
     # -- diffuse field ------------------------------------------------------------------
     def _diffuse_filter(self, rng, level):
@@ -621,17 +765,20 @@ class RainScene(Layer):
         buf = torch.zeros(2, n + self.Lmax + 256, device=self.dev)
         buf[:, : self.tail.shape[1]] += self.tail
         for i, p in enumerate(self.patches):
-            got = self._take(i, end)
-            if got is None:
-                continue
-            t, m, delays, amps = got
-            L = SHORT_L if self.banks[i] is not None else self.surfaces[i].L
-            render_events(buf, t - start, delays, amps, m, L)
+            got = self._take_from(self.pending[i], end)
+            if got is not None:
+                t, att, delays = got[:3]
+                picks = [(got[3 + 2 * g], got[4 + 2 * g].transpose(1, 0, 2)) for g in range(len(self.pools[i].groups))]
+                self.pools[i].render(buf, t - start, delays.T, att, picks)
             if self.banks[i] is not None:
-                got = self._take_bank(i, end)
+                got = self._take_from(self.bank_pending[i], end)
                 if got is not None:
-                    t, k, g = got
-                    render_bank(buf, t - start, k, g, self.banks[i])
+                    t, idx, amp = got
+                    self.banks[i].render(buf, t - start, idx, amp)
+        # The GPU works through what was just queued; meanwhile prepare the next chunk's
+        # drops (assuming the same size), which is what the CPU would otherwise do later.
+        while self.gen_until < end + n + CTRL:
+            self._generate_unit()
         self.tail = buf[:, n:].clone()
         out = buf[:, :n].T.cpu().numpy().astype(np.float64)
 
@@ -650,6 +797,7 @@ class RainScene(Layer):
             out = out + self.room_wet * self.room(out)
         self.pos = end
         return out * self.gain
+
 
 
 def _sub(m: Modes, sel):

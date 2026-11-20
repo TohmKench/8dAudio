@@ -70,6 +70,121 @@ def rings(rng, d, v, k, f_lo, f_hi, q_lo, q_hi, gain, cap=None):
     return Modes(f, tau, amp, rng.uniform(0, 2 * np.pi, (E, k)), np.zeros((E, k)), _attack(d, v))
 
 
+# ------------------------------------------------------------------ parts of a drop sound
+# Each surface's sound is a list of parts (a click, a ring, a bubble). A part can draw
+# fresh modes for every drop (modes), or work from a *pool*: a large shared set of
+# single decaying resonances drawn from exactly the same distribution, rendered once
+# on the GPU. Each drop then picks its own k members of the pool and gives each its own
+# strength (pick), so drops still differ, at a fraction of the cost. With thousands of
+# members spread over the band, the frequencies sit closer together than the ear can
+# tell apart.
+
+class Burst:
+    """The contact click: k very short-lived random modes."""
+
+    short = True
+    members = 256  # pool size when rendered as a filter bank (see scene.DropPool)
+
+    def __init__(self, k, f_lo, f_hi, tau_lo, tau_hi, gain):
+        self.k, self.args = k, (f_lo, f_hi, tau_lo, tau_hi, gain)
+
+    def modes(self, rng, d, v):
+        return clicks(rng, d, v, self.k, *self.args)
+
+    def pool(self, rng, n):
+        f_lo, f_hi, tau_lo, tau_hi, _ = self.args
+        return dict(f=_loguni(rng, f_lo, f_hi, n), tau=rng.uniform(tau_lo, tau_hi, n))
+
+    def _gain(self):
+        return self.args[-1]
+
+    def pick(self, rng, d, v, pool):
+        """Pool members (E, k) for each drop and their amplitudes, as modes() would give."""
+        E, k = len(d), self.k
+        idx = rng.integers(0, len(pool["f"]), (E, k))
+        f = pool["f"][idx]
+        amp = rng.normal(0, 1, (E, k)) / np.sqrt(k)
+        amp *= self._gain() * P.impact_strength(d, v)[:, None] * P.force_weight(f, d, v)
+        return idx, amp
+
+
+class Ring(Burst):
+    """k resonances with a quality factor (a tile, a leaf or a sheet ringing on)."""
+
+    short = False
+
+    def __init__(self, k, f_lo, f_hi, q_lo, q_hi, gain, cap=None, members=256):
+        self.k, self.args, self.cap, self.members = k, (f_lo, f_hi, q_lo, q_hi, gain), cap, members
+
+    def modes(self, rng, d, v):
+        return rings(rng, d, v, self.k, *self.args, cap=self.cap)
+
+    def pool(self, rng, n):
+        f_lo, f_hi, q_lo, q_hi, _ = self.args
+        f = _loguni(rng, f_lo, f_hi, n)
+        return dict(f=f, tau=_q_tau(f, rng.uniform(q_lo, q_hi, n), self.cap))
+
+
+class Bubble:
+    """The bubble a drop traps in water. Small drops (0.8-1.1 mm) trap a tiny bubble that
+    rings at 13-18 kHz (the "fizz" of rain on water); big drops sometimes trap a larger,
+    lower bubble; medium drops rarely make one. A drip into a puddle rings longer."""
+
+    short = False
+    k = 1
+    members = 256
+
+    def __init__(self, drip=False):
+        self.drip = drip
+
+    def _p_small(self, d):
+        return np.where(d < 0.8, 0.0, np.where(d < 1.15, 0.8, np.where(d < 2.2, 0.05, 0.4)))
+
+    def modes(self, rng, d, v):
+        E = len(d)
+        if self.drip:
+            p = np.full(E, 0.85)
+            a = rng.uniform(0.9, 3.5, E)
+            q = rng.uniform(1.6, 2.6, E)
+        else:
+            p = self._p_small(d)
+            a = np.where(d < 1.15, rng.uniform(0.19, 0.26, E), rng.uniform(0.4, 2.2, E))
+            q = rng.uniform(0.9, 1.3, E)
+        has = rng.random(E) < p
+        f0 = P.minnaert_hz(a)
+        damp = P.bubble_damping(f0)
+        tau = q / damp
+        chirp = rng.uniform(0.04, 0.1, E) * damp  # the slight upward 'blip' of a real bubble
+        amp = has * 1.1 * P.impact_strength(d, v) * rng.uniform(0.5, 1.0, E) * (a / 1.0) ** 0.25
+        return Modes(f0[:, None], tau[:, None], amp[:, None], rng.uniform(0, 2 * np.pi, (E, 1)),
+                     chirp[:, None], _attack(d, v))
+
+    def pool(self, rng, n):
+        if self.drip:
+            a = rng.uniform(0.9, 3.5, n)
+            q = rng.uniform(1.6, 2.6, n)
+        else:  # first half: the small bubbles, second half: the big ones
+            h = n // 2
+            a = np.concatenate([rng.uniform(0.19, 0.26, h), rng.uniform(0.4, 2.2, n - h)])
+            q = rng.uniform(0.9, 1.3, n)
+        f0 = P.minnaert_hz(a)
+        damp = P.bubble_damping(f0)
+        return dict(f=f0, tau=q / damp, chirp=rng.uniform(0.04, 0.1, n) * damp, a=a)
+
+    def pick(self, rng, d, v, pool):
+        E, n = len(d), len(pool["f"])
+        if self.drip:
+            p = np.full(E, 0.85)
+            idx = rng.integers(0, n, E)
+        else:
+            p = self._p_small(d)
+            h = n // 2
+            idx = np.where(d < 1.15, rng.integers(0, h, E), rng.integers(h, n, E))
+        has = rng.random(E) < p
+        amp = has * 1.1 * P.impact_strength(d, v) * rng.uniform(0.5, 1.0, E) * pool["a"][idx] ** 0.25
+        return idx[:, None], amp[:, None]
+
+
 SHORT_L = 256  # samples rendered for the contact clicks (they are gone within ~5 ms)
 FLOOR_DB = 40.0  # every mode is at least this far down by the end of its window
 SPOTS = 6  # plates: landing spots per panel side for the precomputed responses
@@ -78,12 +193,13 @@ SIZE_BINS = np.array([0.4, 0.8, 1.4, 2.4, 4.0])  # plates: drop-size classes (mm
 
 class Surface:
     L = 1024  # samples rendered per drop (long enough for the slowest mode to die away)
+    parts: tuple = ()  # the parts of each drop's sound, the click first
 
     def __init__(self, rng, size=(1.0, 1.0)):
         self.size = size
 
-    def modes(self, rng, d, v, uv) -> Modes:  # pragma: no cover - interface
-        raise NotImplementedError
+    def modes(self, rng, d, v, uv) -> Modes:
+        return Modes.stack([p.modes(rng, d, v) for p in self.parts])
 
     def voice(self, rng, d, v, uv) -> Modes:
         """modes(), with every decay short enough to have faded out (-40 dB) inside the
@@ -98,9 +214,7 @@ class Surface:
 
 
 class Water(Surface):
-    """Lake, pond or puddle. Small drops (0.8-1.1 mm) trap a tiny bubble that rings
-    at 13-18 kHz (the "fizz" of rain on water); big drops sometimes trap a larger,
-    lower bubble. Medium drops rarely make a bubble at all."""
+    """Lake, pond or puddle: a light click, then (sometimes) a ringing bubble."""
 
     L = 640
 
@@ -109,47 +223,21 @@ class Water(Surface):
         self.drip = drip
         if drip:
             self.L = 2400  # a drip into a puddle rings longer ("plonk")
-
-    def modes(self, rng, d, v, uv):
-        E = len(d)
-        c = clicks(rng, d, v, 5, 900, 12000, 0.05e-3, 0.22e-3, 0.5)
-        if self.drip:
-            p = np.full(E, 0.85)
-            a = rng.uniform(0.9, 3.5, E)
-            q = rng.uniform(1.6, 2.6, E)
-        else:
-            p = np.where(d < 0.8, 0.0, np.where(d < 1.15, 0.8, np.where(d < 2.2, 0.05, 0.4)))
-            a = np.where(d < 1.15, rng.uniform(0.19, 0.26, E), rng.uniform(0.4, 2.2, E))
-            q = rng.uniform(0.9, 1.3, E)
-        has = rng.random(E) < p
-        f0 = P.minnaert_hz(a)
-        damp = P.bubble_damping(f0)
-        tau = q / damp
-        chirp = rng.uniform(0.04, 0.1, E) * damp  # the slight upward 'blip' of a real bubble
-        amp = has * 1.1 * P.impact_strength(d, v) * rng.uniform(0.5, 1.0, E) * (a / 1.0) ** 0.25
-        b = Modes(f0[:, None], tau[:, None], amp[:, None], rng.uniform(0, 2 * np.pi, (E, 1)),
-                  chirp[:, None], c.attack)
-        return Modes.stack([c, b])
+        self.parts = (Burst(5, 900, 12000, 0.05e-3, 0.22e-3, 0.5), Bubble(drip))
 
 
 class Leaf(Surface):
     """A leaf: a light, floppy plate. A soft tap with a short, woody resonance."""
 
     L = 1408
-
-    def modes(self, rng, d, v, uv):
-        return Modes.stack([clicks(rng, d, v, 4, 1000, 10000, 0.08e-3, 0.35e-3, 0.6),
-                            rings(rng, d, v, 3, 450, 3000, 3, 8, 0.55)])
+    parts = (Burst(4, 1000, 10000, 0.08e-3, 0.35e-3, 0.6), Ring(3, 450, 3000, 3, 8, 0.55))
 
 
 class Ground(Surface):
     """Soil, grass or leaf litter: dull, short, low."""
 
     L = 768
-
-    def modes(self, rng, d, v, uv):
-        return Modes.stack([clicks(rng, d, v, 5, 250, 3500, 0.15e-3, 0.7e-3, 0.7),
-                            rings(rng, d, v, 1, 200, 800, 1.5, 3, 0.25)])
+    parts = (Burst(5, 250, 3500, 0.15e-3, 0.7e-3, 0.7), Ring(1, 200, 800, 1.5, 3, 0.25, members=64))
 
 
 class Tile(Surface):
@@ -157,11 +245,8 @@ class Tile(Surface):
     a brief stony ring, and a faint low knock through the roof structure."""
 
     L = 2304
-
-    def modes(self, rng, d, v, uv):
-        return Modes.stack([clicks(rng, d, v, 4, 1500, 14000, 0.05e-3, 0.25e-3, 0.9),
-                            rings(rng, d, v, 3, 600, 5500, 10, 25, 0.35),
-                            rings(rng, d, v, 1, 90, 220, 1.5, 2.0, 0.3)])
+    parts = (Burst(4, 1500, 14000, 0.05e-3, 0.25e-3, 0.9), Ring(3, 600, 5500, 10, 25, 0.35),
+             Ring(1, 90, 220, 1.5, 2.0, 0.3, members=64))
 
 
 PLATE_MATERIALS = {
@@ -194,6 +279,8 @@ class Plate(Surface):
         spec = PLATE_MATERIALS[material]
         self.spec = spec
         self.L = spec["L"]
+        # Only the contact click is drawn per drop; the sheet's ring comes from the bank.
+        self.parts = (Burst(*spec["clicks"]),)
         pa, pb = spec["panel"]
         # A grid of sheets/panes: e.g. a 6 x 7 m metal roof is ~20 separate sheets,
         # each with its own slightly different set of modes.
@@ -250,23 +337,28 @@ class Plate(Surface):
         su, sv = ((u - iu) * SPOTS).astype(int), ((w - iv) * SPOTS).astype(int)
         return iu * self.nv + iv, su * SPOTS + sv
 
-    def click_modes(self, rng, d, v):
-        """Just the contact click, rendered per drop (the sheet's ring comes from the bank)."""
-        m = clicks(rng, d, v, *self.spec["clicks"])
-        m.tau = np.minimum(m.tau, SHORT_L / (FLOOR_DB / 8.686 * P.SR))
-        return m
+    def resonators(self):
+        """Every panel's fixed resonances (its modes, then its boom): frequency, decay and
+        validity, each shaped (panels, K)."""
+        spec = self.spec
+        f, tau, ok = self.pf, _q_tau(self.pf, self.pq, spec["cap"]), self.valid
+        if self.boom_f is not None:
+            f = np.concatenate([f, self.boom_f], axis=1)
+            tau = np.concatenate([tau, self.boom_q / (np.pi * self.boom_f)], axis=1)
+            ok = np.concatenate([ok, np.ones_like(self.boom_f, dtype=bool)], axis=1)
+        return f, np.minimum(tau, self.L / (FLOOR_DB / 8.686 * P.SR)), ok
 
     def bank_modes(self, v_bins, rng):
-        """Modes of every panel for a drop of unit impact strength landing at the centre of
-        each spot, for each drop-size class. Returns f, tau, amp shaped (panels, spots,
-        sizes, modes) and the attack per size."""
+        """Which resonances a drop of unit impact strength excites, and how strongly, for each
+        (panel, landing spot, drop-size class): indices into resonators() and amplitudes,
+        both shaped (panels, spots, sizes, modes per drop)."""
         spec = self.spec
         Pn, S, B = self.n_panels, SPOTS * SPOTS, len(SIZE_BINS)
         cell = np.repeat(np.arange(SPOTS), SPOTS), np.tile(np.arange(SPOTS), SPOTS)
         m = min(spec["m"], self.k)
         kb = 0 if self.boom_f is None else self.boom_f.shape[1]
-        F = np.zeros((Pn, S, B, m + kb))
-        TAU, AMP = np.ones_like(F), np.zeros_like(F)
+        IDX = np.zeros((Pn, S, B, m + kb), dtype=np.int64)
+        AMP = np.zeros((Pn, S, B, m + kb))
         for p in range(Pn):
             # A point somewhere inside each spot's cell (not its exact centre: a regular grid
             # would sample the high-order mode shapes at the same few values every time).
@@ -279,20 +371,14 @@ class Plate(Surface):
                 score = np.abs(shape) * w * self.valid[p] * rng.uniform(0.6, 1.4, shape.shape)
                 top = np.argsort(-score, axis=1)[:, :m]
                 rows = np.arange(S)[:, None]
-                f_sel = self.pf[p][top]
-                F[p, :, b, :m] = f_sel
-                TAU[p, :, b, :m] = _q_tau(f_sel, self.pq[p][top], spec["cap"])
+                IDX[p, :, b, :m] = top
                 AMP[p, :, b, :m] = (shape * w)[rows, top] * self.valid[p][top] * spec["gain"] / np.sqrt(m) * 2.0
                 if kb:
-                    fb = self.boom_f[p]
-                    wb = P.force_weight(fb[None], np.array([d]), np.array([v]))[0]
-                    F[p, :, b, m:] = fb
-                    TAU[p, :, b, m:] = self.boom_q[p] / (np.pi * fb)
+                    wb = P.force_weight(self.boom_f[p][None], np.array([d]), np.array([v]))[0]
+                    IDX[p, :, b, m:] = self.k + np.arange(kb)
                     AMP[p, :, b, m:] = (self.boom_sign[p] * self.boom_gain * wb / np.sqrt(kb))[None] * \
                         (np.sin(np.pi * su) * np.sin(np.pi * sv))[:, None] * 2.2
-        TAU = np.minimum(TAU, self.L / (FLOOR_DB / 8.686 * P.SR))
-        attack = _attack(SIZE_BINS, np.asarray(v_bins))
-        return F, TAU, AMP, attack
+        return IDX, AMP
 
     def modes(self, rng, d, v, uv):
         spec = self.spec

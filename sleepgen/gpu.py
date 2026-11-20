@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
+
 _device = None
 
 
@@ -82,3 +84,29 @@ def default_budget() -> int:
 def batch_elements() -> int:
     """How many (event x mode x sample) values to work on at once."""
     return 96_000_000 if is_gpu() else 2_000_000
+
+
+def scatter_rate() -> float:
+    """Additions per second when copying each event's samples into the output (index_add_).
+    Measured: ~2.9e9 on a Radeon RX 9060 XT (flat, whatever the overlap), ~2.3e8 on a CPU."""
+    return 2.9e9 if is_gpu() else 2.3e8
+
+
+def fft_rate() -> float:
+    """Samples per second through an FFT filter bank (rfft, multiply, sum, irfft), per train.
+    Measured: ~4e9 on a Radeon RX 9060 XT, ~6e8 on a CPU."""
+    return 4.0e9 if is_gpu() else 6.0e8
+
+
+def upload(a, dtype=None):
+    """A numpy array as a tensor on the compute device. On a CUDA/ROCm GPU the copy goes
+    through pinned memory without waiting, so the CPU can queue more work while the GPU
+    is busy (a plain copy from ordinary memory waits for everything queued before it)."""
+    torch = _torch()
+    t = torch.from_numpy(np.ascontiguousarray(a))
+    if dtype is not None:
+        t = t.to(dtype)
+    d = device()
+    if d.type == "cuda":
+        return t.pin_memory().to(d, non_blocking=True)
+    return t.to(d)

@@ -158,7 +158,9 @@ def test_reverb_has_no_seams_between_chunks():
                          {"type": "crickets", "params": {}, "send": 0.8, "dry": 0.4}]}
     a = _render_raw(recipe, 8, 1.0)
     b = _render_raw(recipe, 8, 3.7)
-    np.testing.assert_allclose(a, b, atol=1e-8)
+    from sleepgen import gpu
+    # On a GPU the convolution runs in float32 (rounding differs with the block size).
+    np.testing.assert_allclose(a, b, atol=2e-5 if gpu.is_gpu() else 1e-8)
 
 
 def test_leveler_eases_loud_parts_down_only():
@@ -314,3 +316,68 @@ def test_fire_recipes_fit_the_setting():
         r = random_recipe(seed, "rain")
         if r["layers"][0]["params"]["environment"] in ("lake", "forest", "tent"):
             assert "fire" not in r["meta"]["secondaries"]
+
+
+def test_filter_bank_matches_direct_copies():
+    """The FFT filter bank gives the same sum as copying each impulse's response in place,
+    across block edges, for per-impulse ears (pools) and fixed per-panel ears (sheets)."""
+    import torch
+    from sleepgen import gpu
+    from sleepgen.scene import FilterBank
+    rng = np.random.default_rng(0)
+    dev = gpu.device()
+    P_, K, L, N, Q = 3, 4, 700, 60000, 400
+    waves = rng.standard_normal((P_ * K, L)).astype(np.float32)
+    wt = torch.as_tensor(waves, device=dev)
+    member = rng.integers(0, P_ * K, Q)
+    tol = 2e-4 if gpu.is_gpu() else 2e-5
+
+    # Per-impulse ears.
+    pos = rng.integers(0, N, (2, Q))
+    amp = rng.standard_normal((2, Q))
+    buf = torch.zeros(2, N + FilterBank(wt, dev).span + 64, device=dev)
+    FilterBank(wt, dev).render(buf, pos, member, amp)
+    ref = np.zeros((2, buf.shape[1]))
+    for e in range(2):
+        for q in range(Q):
+            ref[e, pos[e, q]:pos[e, q] + L] += amp[e, q] * waves[member[q]]
+    np.testing.assert_allclose(buf.cpu().numpy(), ref, atol=tol * np.abs(ref).max())
+
+    # Fixed gain per ear for each resonance and a delay per ear for each group of K.
+    gains = rng.uniform(0.2, 1.0, (P_, 2, K))
+    delays = rng.integers(0, 30, (2, P_))
+    fb = FilterBank(wt, dev, gains, delays)
+    p1 = rng.integers(0, N, (1, Q))
+    a1 = rng.standard_normal((1, Q))
+    buf = torch.zeros(2, N + fb.span + 64, device=dev)
+    fb.render(buf, p1, member, a1)
+    ref = np.zeros((2, buf.shape[1]))
+    for q in range(Q):
+        g, k = divmod(member[q], K)
+        for e in range(2):
+            s = p1[0, q] + delays[e, g]
+            ref[e, s:s + L] += a1[0, q] * gains[g, e, k] * waves[member[q]]
+    np.testing.assert_allclose(buf.cpu().numpy(), ref, atol=tol * np.abs(ref).max())
+
+
+def test_rain_pool_paths_agree():
+    """Drops copied from the pool and drops rendered through the filter bank sound the same
+    (same level and spectrum per band), so the faster path can be chosen freely."""
+    from scipy import signal
+    from sleepgen import gpu
+    from sleepgen.scene import RainScene
+
+    def bands(force_fft):
+        old = gpu.scatter_rate
+        gpu.scatter_rate = (lambda: 1.0) if force_fft else (lambda: 1e30)
+        try:
+            s = RainScene(np.random.default_rng(4), environment="forest", rain_mm_h=4, budget=1500, calibrate=False)
+        finally:
+            gpu.scatter_rate = old
+        s.diffuse = None
+        s.room = None
+        x = s(SR * 6)
+        f, p = signal.welch(x.mean(1), SR, nperseg=4096)
+        return np.array([10 * np.log10(p[(f > b / 1.41) & (f < b * 1.41)].mean()) for b in (250, 1000, 4000)])
+
+    np.testing.assert_allclose(bands(True), bands(False), atol=1.5)

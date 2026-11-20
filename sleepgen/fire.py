@@ -572,6 +572,8 @@ class FireScene(Layer):
             if got is not None:
                 t, m, delays, amps = got
                 render_events(buf, t - start, delays, amps * g, m, q.L)
+        while self.gen_until < end + n + UNIT:  # prepare the next chunk while the GPU works
+            self._generate_unit()
         self.tail = buf[:, n:].clone()
         out = buf[:, :n].T.cpu().numpy().astype(np.float64)
 
