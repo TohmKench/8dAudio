@@ -317,6 +317,15 @@ def test_fire_crackles_lead_a_quiet_bed():
         assert parts["fizz"] < whole - 10 and parts["hiss"] < whole - 12
 
 
+def test_wood_stove_survives_ticks_and_settling_together():
+    """A settling log and the stove's iron ticks waiting to be rendered at the same time
+    (different voices) once crashed the render; over a 10 h stove video that is near certain."""
+    s = FireScene(np.random.default_rng(1), environment="wood_stove", budget=600)
+    s.settle_gap, s.tick_gap = 1.5, 1.0
+    for _ in range(12):
+        assert np.all(np.isfinite(s(SR)))
+
+
 def test_fire_cracks_have_no_pitched_ring():
     """A pitched ring in the low treble, repeated through a crack's sputter, is how bubbling
     liquid sounds: fire v2 had one and was heard as "wet globs". Below 4 kHz every mode of

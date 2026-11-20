@@ -351,6 +351,7 @@ class FireScene(Layer):
         self.bright = w["bright"]
         self.whistle_per_s = w["whistle"] * self.damp / 60.0
         self.settle_gap = env_rng.uniform(150, 420)  # s between log settles, on average
+        self.tick_gap = 25.0  # s between the stove's iron ticks, on average
         # Ember ticks per second at intensity 1: a sprinkle of distinct ticks, not a wash.
         self.fizz_phys = 80.0 * place.rate_scale ** 0.5 * (1 + 1.5 * self.damp)
         budget = int(budget or gpu.default_budget())
@@ -377,8 +378,8 @@ class FireScene(Layer):
         self.noise_rng = child(rng)
         self.whistle_rng = child(rng)
         self.q_pop, self.q_grain, self.q_fizz = _Queue(POP_L), _Queue(SHORT_L), _Queue(SHORT_L)
-        self.q_low = _Queue(THUMP_L)
-        self.queues = [self.q_pop, self.q_grain, self.q_fizz, self.q_low]
+        self.q_low, self.q_tick = _Queue(THUMP_L), _Queue(THUMP_L)  # one voice per queue (mode counts differ)
+        self.queues = [self.q_pop, self.q_grain, self.q_fizz, self.q_low, self.q_tick]
         self.Lmax = THUMP_L
         self.tail = self.torch.zeros(2, self.Lmax + 256, device=self.dev)
         self.ctrl = np.zeros((0, 3))  # roar envelope, hiss envelope, intensity
@@ -519,10 +520,10 @@ class FireScene(Layer):
             self._emit(self.q_pop, rng, t, pop_modes(rng, rng.uniform(0.1, 0.5, n), self.bright))
             self._emit(self.q_low, rng, np.array([t0 + rng.uniform(0, 0.1) * SR]), thump_modes(rng, np.array([0.9])))
         if self.place.ticks:
-            k = rng.poisson(1 / 25.0)
+            k = rng.poisson(1 / self.tick_gap)
             if k:
                 # On the outside of the stove, so not muffled by its walls.
-                self._emit(self.q_low, rng, u0 + rng.random(k) * UNIT, tick_modes(rng, rng.uniform(0.2, 0.5, k)),
+                self._emit(self.q_tick, rng, u0 + rng.random(k) * UNIT, tick_modes(rng, rng.uniform(0.2, 0.5, k)),
                            through=False)
         # Sap and steam "singing": rare, soft, gliding, fades in and out.
         if rng.random() < self.whistle_per_s:
@@ -588,7 +589,7 @@ class FireScene(Layer):
         buf[:, : self.tail.shape[1]] += self.tail
         g_ = {k: (0.0 if k in self.mute else v) for k, v in self.g.items()}
         for q, g in ((self.q_pop, g_["crackle"]), (self.q_grain, g_["crackle"]), (self.q_fizz, g_["fizz"]),
-                     (self.q_low, g_["crackle"])):
+                     (self.q_low, g_["crackle"]), (self.q_tick, g_["crackle"])):
             got = q.take(end)
             if got is not None:
                 t, m, delays, amps = got
