@@ -480,9 +480,23 @@ def _firescene(rng, **params):
     return FireScene(rng, **params)
 
 
+def _page_turns(rng, **params):
+    from .desk import PageTurns
+
+    return PageTurns(rng, **params)
+
+
+def _pencil(rng, **params):
+    from .desk import Pencil
+
+    return Pencil(rng, **params)
+
+
 LAYER_TYPES = {
     "rainscene": _rainscene,
     "firescene": _firescene,
+    "page_turns": _page_turns,
+    "pencil": _pencil,
     "noise": NoiseLayer,
     "rain": Rain,
     "thunder": Thunder,

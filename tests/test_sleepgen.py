@@ -162,7 +162,7 @@ def test_bases_only_offer_known_parts():
 def test_scenes_fix_every_tier():
     from sleepgen.recipes import SCENES, available_scenes, scene_recipe, scene_status
     ready = available_scenes()
-    assert "rainy_fireside" in ready and "beach_night" in ready
+    assert {"rainy_study_window", "rainy_fireside", "beach_night"} <= set(ready)
     for name in ready:
         s, r = SCENES[name], scene_recipe(name, 3)
         m = r["meta"]
@@ -504,3 +504,103 @@ def test_rain_pool_paths_agree():
         return np.array([10 * np.log10(p[(f > b / 1.41) & (f < b * 1.41)].mean()) for b in (250, 1000, 4000)])
 
     np.testing.assert_allclose(bands(True), bands(False), atol=1.5)
+
+
+# -- study scenes: desk sounds, candle, level matching, image credit ---------------------
+
+from sleepgen import desk  # noqa: E402
+from sleepgen.dsp import rms  # noqa: E402
+
+
+@pytest.mark.parametrize("cls,kw", [
+    (desk.PageTurns, {"mean_gap": 6, "paper": "book"}),
+    (desk.PageTurns, {"mean_gap": 6, "paper": "notebook", "flurry": 0.5}),
+    (desk.Pencil, {"activity": 0.5, "surface": "pad"}),
+    (desk.Pencil, {"activity": 0.5, "surface": "desk"}),
+])
+def test_desk_sounds_are_gentle_events_whatever_the_chunk_size(cls, kw):
+    one, other = cls(np.random.default_rng(2), **kw), cls(np.random.default_rng(2), **kw)
+    a = np.concatenate([one(SR) for _ in range(40)])
+    b = np.concatenate([other(int(0.37 * SR)) for _ in range(int(40 / 0.37) + 1)])[: len(a)]
+    assert np.all(np.isfinite(a))
+    np.testing.assert_allclose(a, b, atol=1e-12)
+    win = SR // 100
+    ms = np.mean(a[: len(a) // win * win] ** 2, axis=1).reshape(-1, win).mean(axis=1)
+    assert 0.2 < np.mean(ms < 1e-10) < 0.97  # silent between events
+    loud = ms[ms > ms.max() * 0.01]
+    assert 0.5 < np.sqrt(loud.mean()) < 2.0  # about unit RMS while sounding
+    assert 10 * np.log10(ms.max() / loud.mean()) < 12  # no 10 ms burst far over the rest of it
+    assert 20 * np.log10(np.abs(a).max() / np.sqrt(loud.mean())) < 24  # and no sharp clicks
+    # One source on the desk, heard by both ears a fraction of a millisecond apart.
+    lags = range(-48, 49)
+    xc = [np.dot(a[48:-48, 0], np.roll(a[:, 1], k)[48:-48]) for k in lags]
+    assert max(xc) / np.sqrt(np.dot(a[:, 0], a[:, 0]) * np.dot(a[:, 1], a[:, 1])) > 0.6
+
+
+def test_paper_friction_is_brighter_and_louder_when_faster():
+    """The paper's surface is read out at the sliding speed, as with a real pencil."""
+    d = desk._Desk(np.random.default_rng(1))
+
+    def centroid_and_level(v):
+        x = d.friction(d.tex_graphite, np.full(SR, v), np.ones(SR))
+        f, p = np.fft.rfftfreq(SR, 1 / SR), np.abs(np.fft.rfft(x)) ** 2
+        return np.sum(f * p) / np.sum(p), rms(x)
+
+    (c1, r1), (c2, r2) = centroid_and_level(0.02), centroid_and_level(0.08)
+    assert c2 > 1.5 * c1 and r2 > 1.5 * r1
+
+
+def test_study_parts_only_in_study_videos_and_indoors():
+    desk_parts = {"page_turns", "pencil"}
+    seen = False
+    for seed in range(40):
+        assert not desk_parts & set(random_recipe(seed, "rain")["meta"]["tertiaries"])  # never in sleep videos
+        m = random_recipe(seed, "rain", video_type="study")["meta"]
+        seen |= bool(desk_parts & set(m["tertiaries"]))
+        if m["modifier"] in ("lake", "forest", "tent"):
+            assert not desk_parts & set(m["tertiaries"]) and "candle" not in m["secondaries"]
+    assert seen
+    r = random_recipe(1, "fire", modifier="candle")
+    assert r["layers"][0]["params"]["wood"] == "wick" and r["meta"]["base_title"] == "Crackling Candle"
+
+
+def test_layer_levels_are_measured_so_they_mean_the_same_for_every_seed():
+    """A layer's own level can miss unit RMS by several dB (rain varies with the scene drawn),
+    which would make a secondary's level_db mean something different in every video."""
+    raw, voiced = [], []
+    for seed in (1, 4):
+        recipe = {"seed": seed, "layers": [{"type": "rainscene", "params": {"environment": "window",
+                                                                             "rain_mm_h": 2.0}}]}
+        v = engine.build_voices(recipe)[0]
+        voiced.append(20 * np.log10(rms(v(SR * 25))))
+        raw.append(20 * np.log10(1 / v.norm))
+    assert all(abs(x) < 1.0 for x in voiced)
+    assert all(np.isfinite(raw))
+
+
+IMAGE = {"source": "unsplash", "photographer": "Jane Doe", "photographer_url": "https://unsplash.com/@janedoe",
+         "photo_url": "https://unsplash.com/photos/abc123", "fetched": "2026-11-20"}
+
+
+def test_description_always_credits_the_image_owner(tmp_path):
+    from sleepgen.__main__ import main
+    from sleepgen.describe import MissingCredit, video_metadata
+    from sleepgen.recipes import scene_recipe
+    r = scene_recipe("rainy_study_window", 1)
+    with pytest.raises(MissingCredit):
+        video_metadata(r, 8)
+    for bad in ({**IMAGE, "photographer": " "}, {k: v for k, v in IMAGE.items() if k != "photo_url"},
+                {**IMAGE, "source": "google images"}, {**IMAGE, "photographer_url": "janedoe"}):
+        r["image"] = bad
+        with pytest.raises(MissingCredit):
+            video_metadata(r, 8)
+    path = tmp_path / "r.json"
+    path.write_text(json.dumps(r))
+    assert main(["describe", str(path)]) == 2  # the command line refuses too
+    r["image"] = IMAGE
+    m = video_metadata(r, 8)
+    assert "Background photo by Jane Doe on Unsplash: https://unsplash.com/photos/abc123" in m["description"]
+    assert m["description"].rstrip().endswith(IMAGE["photographer_url"])
+    assert m["title"] == "Studying by a Rainy Window · 8 Hours" and len(m["title"]) <= 100
+    assert "pencil writing" in m["tags"]
+

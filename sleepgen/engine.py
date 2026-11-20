@@ -18,9 +18,10 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import layers as L
-from .dsp import SR, Leveler, MatchEQ, Reverb, equal_power_pan, loudness_lufs, lowpass, smooth_lfo, soft_limit
+from .dsp import SR, Leveler, MatchEQ, Reverb, equal_power_pan, loudness_lufs, lowpass, rms, smooth_lfo, soft_limit
 
 DEFAULT_TARGET_LUFS = -26.0  # quiet and steady for sleep; YouTube never turns quiet audio up
+LEVEL_PROBE_S = 20.0  # seconds of each steady layer measured so `level_db` means the same for all
 
 
 @dataclass
@@ -35,10 +36,11 @@ class Voice:
     send: float = 0.0  # how much goes into the shared reverb (0..1)
     dry: float = 1.0  # direct sound; lower = further away
     rng: np.random.Generator = field(default_factory=np.random.default_rng)
+    norm: float = 1.0  # brings the layer to unit RMS (measured), so level_db is relative to the base
     pos: int = 0
 
     def __post_init__(self):
-        self.gain = 10 ** (self.level_db / 20)
+        self.gain = 10 ** (self.level_db / 20) * self.norm
         d = self.drift or {}
         self.drift_db = float(d.get("depth_db", 0.0))
         base = float(d.get("period_s", 120.0))
@@ -109,10 +111,19 @@ def build_voices(recipe: dict) -> list[Voice]:
         kind = spec["type"]
         if kind not in L.LAYER_TYPES:
             raise ValueError(f"unknown layer type {kind!r}")
-        layer = L.LAYER_TYPES[kind](np.random.default_rng(children[2 * i]), **spec.get("params", {}))
+        def make():
+            return L.LAYER_TYPES[kind](np.random.default_rng(children[2 * i]), **spec.get("params", {}))
+
+        layer = make()
+        norm = 1.0
+        if layer.continuous and spec.get("normalize", True):
+            # Layers aim for unit RMS but can miss by several dB (rain varies with the scene
+            # drawn, a fire with how much its limiter works). Measure an identical twin, so the
+            # real layer still starts fresh, and correct for it.
+            norm = 1.0 / max(rms(make()(int(SR * LEVEL_PROBE_S))), 1e-9)
         voices.append(Voice(layer, spec.get("level_db", 0.0), spec.get("pan"), spec.get("drift"),
                             spec.get("gate"), float(spec.get("send", 0.0)), float(spec.get("dry", 1.0)),
-                            np.random.default_rng(children[2 * i + 1])))
+                            np.random.default_rng(children[2 * i + 1]), norm))
     return voices
 
 

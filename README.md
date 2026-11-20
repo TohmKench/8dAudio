@@ -1,23 +1,37 @@
 # 8dAudio / sleepgen
 
-`sleepgen` makes long (6 to 12 hour), calm soundscapes for a sleep channel: rain, thunder, ocean,
-fan, wind, crickets, brown/pink noise, binaural beats and soft drones, with slow 8D-style movement.
-Every video gets a randomly generated recipe, so no two uploads are the same mix.
+`sleepgen` makes long (6 to 12 hour), calm soundscapes for a sleep and study channel: rain, fire,
+ocean, fan, noise, frequencies, a crackling candle, pages turning, a pencil writing, crickets, distant
+thunder and more, with slow 8D-style movement. Every video gets its own recipe, so no two uploads are
+the same mix.
 
-## How a mix is built: three tiers
+## How a mix is built: four tiers
 
 | Tier | How many | Level | Examples |
 |---|---|---|---|
-| **Base** | 1, always on | 0 dB | rain, fire, ocean, brown/pink noise, fan, solfeggio drone, stream* |
-| **Secondary** | 0 to 2, always on | 6 to 14 dB under | wind, noise bed, binaural beats, drone, soft rain, fire, stream* |
-| **Accent** | 0 to 1, comes and goes | 8 to 14 dB under | crickets, distant thunder, owl*, frogs*, wind chimes* |
+| **Base** | 1, always on | 0 dB | rain, fire, ocean, noise, fan, frequency drone, stream* |
+| **Base modifier** | 1 per base | part of the base | its place or kind (`window`, `forest`, `campfire`, `candle`, `brown`) and strength (`gentle`, `steady`, `heavy`) |
+| **Secondary** | 0 to 2, always on | 5 to 14 dB under | candle, wind, noise bed, binaural beats, drone, soft rain, fire, stream* |
+| **Tertiary** | 0 to 2, now and then | quiet | page turning, pencil writing, crickets, distant thunder, owl*, frogs*, wind chimes* |
 
 \* needs recordings in the sound library.
 
-Each base lists the secondaries and accents that suit it (`python -m sleepgen themes`). Accents play
-only in the first 45 to 60 minutes and then fade out, so nothing can startle someone who is already
-asleep. Accents are night sounds only: no daytime birdsong. The title headline is built from the
-tiers, e.g. "Gentle Rain with Distant Wind and Crickets".
+`python -m sleepgen catalog` lists every base with its modifiers, what suits it, and the scenes. Each
+video is for **sleep** or **study**. In sleep videos the tertiaries play only in the first 45 to 60
+minutes and then fade out, so nothing can startle someone who is already asleep. Study videos are
+played by people who are awake, so their tertiaries (page turns, pencil) carry on all video. Desk
+sounds are only offered for study videos, and only indoors; night sounds are never offered indoors next
+to a fire.
+
+**Scenes** fix all four tiers and give the video its own title (`SCENES` in `sleepgen/recipes.py`), for
+example "Studying by a Rainy Window" = rain · on the window, gentle · with a candle · with page turns and
+pencil writing. A scene whose sounds aren't built yet is listed by `catalog` with what it still needs.
+Random recipes build their title from the tiers, e.g. "Gentle Rain on the Window with Distant Wind and
+Crickets", and `meta.combo` (`rain/window+wind+crickets`) groups videos for the weekly report.
+
+Every layer's level is measured when a render starts (20 s of an identical copy) and corrected to unit
+RMS, so a secondary's `level_db` means the same in every video (the rain's own level can otherwise vary
+by several dB with the scene drawn).
 
 Needs Python 3.10+, `ffmpeg` on the PATH, and `pip install -r requirements.txt`. Rain is synthesised
 with PyTorch and is meant to run on a GPU (see "Running on the GPU" below).
@@ -25,19 +39,38 @@ with PyTorch and is meant to run on a GPU (see "Running on the GPU" below).
 ## Quick start
 
 ```bash
-python -m sleepgen themes                                  # list themes
-python -m sleepgen previews -d previews --seconds 90       # a short clip of every theme
+python -m sleepgen catalog                                 # bases, modifiers, secondaries, tertiaries, scenes
+python -m sleepgen previews -d previews --seconds 90       # a short clip of every base
 python -m sleepgen previews --rain -d previews             # rain in every environment
-python -m sleepgen previews --fire -d previews             # fire in every setting
+python -m sleepgen previews --fire -d previews             # fire in every setting (and the candle)
+python -m sleepgen previews --scenes -d previews           # every scene that is built
 python -m sleepgen bench                                   # how fast this machine renders rain
-python -m sleepgen random -o out/video1.m4a --hours 10     # random theme, 10 hours
-python -m sleepgen random --theme rain --secondary wind --accent crickets -o out/v.m4a --hours 8
-python -m sleepgen recipe --theme ocean -o ocean.json      # save a recipe, edit it by hand...
+python -m sleepgen random -o out/video1.m4a --hours 10     # random base, 10 hours
+python -m sleepgen random --base rain --modifier window --strength gentle --secondary candle \
+       --tertiary page_turns --tertiary pencil --study -o out/v.m4a --hours 8
+python -m sleepgen random --scene rainy_study_window -o out/study.m4a --hours 8
+python -m sleepgen recipe --base ocean -o ocean.json       # save a recipe, edit it by hand...
 python -m sleepgen render ocean.json -o out/ocean.m4a --hours 12   # ...then render it
+python -m sleepgen describe out/study.json --hours 8      # YouTube title, description, tags
 ```
 
 Each render writes `<name>.json` beside the audio with the full recipe and a render report. The
-recipe's `meta` block (theme, headline, features) feeds video titles and the weekly analytics report.
+recipe's `meta` block (tiers, headline, features) feeds video titles and the weekly analytics report.
+
+## Titles, descriptions and the image credit
+
+`sleepgen/describe.py` builds the YouTube title, description and tags from the recipe. **The background
+and thumbnail image's owner is always credited at the end of the description**, even where the licence
+doesn't require it. The credit is the recipe's `image` block, filled in when the image is picked:
+
+```json
+"image": {"source": "unsplash", "photographer": "Jane Doe", "photographer_url": "https://unsplash.com/@janedoe",
+          "photo_url": "https://unsplash.com/photos/abc123", "fetched": "2026-11-20"}
+```
+
+`video_metadata` (and `python -m sleepgen describe`) refuses a recipe whose credit is missing, partial,
+from an unknown source (Unsplash and Pexels for now) or without real links, so the upload step can't
+publish a video whose image owner isn't named.
 
 ## How it keeps things right for sleep
 
@@ -45,8 +78,9 @@ recipe's `meta` block (theme, headline, features) feeds video titles and the wee
   anything that swells more than 3 dB above that (big waves, thunder), and a soft limiter sits at
   -1 dBFS. YouTube only ever turns loud videos down, never quiet ones up.
 - **One shared space.** All layers feed a convolution reverb with a natural, darkening tail. The
-  base is mostly direct, secondaries sit further back, and accents are mostly reverb, so a cricket
-  sounds like it's out in the garden, not in your ear.
+  base is mostly direct, secondaries sit further back, and night sounds are mostly reverb, so a cricket
+  sounds like it's out in the garden, not in your ear. Desk sounds (candle, pages, pencil) are close
+  and nearly dry.
 - **No surprises.** Rain gets lighter and heavier only over minutes, thunder is rare, low and
   distant, and slow level drift keeps it alive without anything sudden.
 - **No audible loop.** Everything is generated live, and library recordings are played as random
@@ -105,7 +139,7 @@ Recipe parameters: `environment`, `rain_mm_h` (light 1 to 2.5, moderate 2.5 to 7
 
 ## Fire: physical, crackle by crackle
 
-`firescene` builds a wood fire from what a fire physically does, in four settings:
+`firescene` builds a wood fire from what a fire physically does, in five settings:
 
 | Setting | What you hear |
 |---|---|
@@ -113,6 +147,7 @@ Recipe parameters: `environment`, `rain_mm_h` (light 1 to 2.5, moderate 2.5 to 7
 | `fireplace` | An open fireplace across a living room: brick hearth, chimney draw, soft room |
 | `wood_stove` | A cast iron stove with a glass door: muffled crackles, a steady draw, ticking iron |
 | `bonfire` | A big bonfire a few metres off: deep, slow roar and busy crackling |
+| `candle` | A wood-wick candle on the desk in front of you: small, bright crackles in little runs, a tiny flame that flickers at about 14 Hz (the same puffing law), no logs, almost no embers. An ordinary wax candle is silent, so a candle you can hear is a wooden wick. Used as the `candle` secondary and as a fire modifier |
 
 The crackles lead and everything else is a soft, quiet bed under them, the way a real fire close by
 is mostly heard as its cracks and pops rather than as a rushing noise.
@@ -146,6 +181,24 @@ Parameters: `environment`, `intensity` (0.5 gentle to 1.35 roaring), `wood` (`so
 its own exclusions in recipes: no rain around a campfire, no crickets indoors. Under rain on a roof or
 window, fire can also be a secondary ("Rain on the Window with Crackling Fire").
 
+## Desk sounds: pages and pencil
+
+`page_turns` and `pencil` (`sleepgen/desk.py`) are built from what happens physically. Anything sliding on
+paper is the paper's surface profile (fibres and tooth, micrometres apart) read out at the sliding
+speed, so a faster stroke is brighter and louder, as with a real pencil; a hard graphite tip catches
+every grain, a fingertip smooths over them. The paper pad and desk add a little woody resonance.
+
+- **A page turn** is a finger sliding at the corner, a few small crinkles as the page bends, a breath of
+  air as it swings over, a soft flap and low knock as it lands, and a moment of sliding as it settles.
+  Sometimes a hand smooths the page, or a few pages are flipped through. `paper`: `book` or `notebook`;
+  `mean_gap` (s), `flurry`.
+- **Writing** is strokes of 50-250 ms with a smooth rise and fall in speed, run together into words. The
+  pencil lifts between words and lands with a faint tick, and writing comes in spells with thinking
+  pauses between. `activity` (share of time writing), `surface` (`pad` or `desk`), `pressure`.
+
+Both sit on the desk in front, a little to one side, and are silent between events; each event is about
+unit RMS while it sounds.
+
 ## Running on the GPU
 
 `--device` picks where synthesis runs: `auto` (default) tries a CUDA-style GPU, then DirectML, then
@@ -174,12 +227,12 @@ use the machine best.
 ## Sound library (optional)
 
 Point `--library` at a folder with one subfolder per category and sleepgen will blend real
-recordings into matching themes:
+recordings into matching bases, secondaries and tertiaries:
 
 ```
 sounds/
   rain/  rain_roof/  rain_window/  ocean/  stream/  fire/  wind/      (blended into bases and secondaries)
-  crickets/  owl/  frogs/  chimes/                                   (accents)
+  crickets/  owl/  frogs/  chimes/                                   (tertiaries)
 ```
 
 Only use recordings you may use commercially: CC0 / public domain (e.g. Freesound filtered to
@@ -200,12 +253,14 @@ at least 30 seconds long and free of voices, cars, birds and other sharp sounds.
     {"type": "crickets", "level_db": -18, "params": {"count": 3}, "send": 0.75, "dry": 0.4,
      "gate": {"on_s": [20, 60], "off_s": [30, 120], "start_s": 40, "until_s": 3000, "until_fade_s": 300}}
   ],
-  "meta": {"base": "rain", "secondaries": ["wind"], "accents": ["crickets"],
-           "headline": "Rain with Distant Wind and Crickets"}
+  "meta": {"video_type": "sleep", "base": "rain", "modifier": "window", "strength": "steady",
+           "secondaries": ["wind"], "tertiaries": ["crickets"], "combo": "rain/window+wind+crickets",
+           "headline": "Rain on the Window with Distant Wind and Crickets"},
+  "image": {"source": "unsplash", "photographer": "...", "photographer_url": "...", "photo_url": "..."}
 }
 ```
 
-Layer types: `rainscene`, `firescene`, `noise`, `rain` (older, simpler rain), `thunder`, `ocean`, `fan`, `wind`, `crickets`, `binaural`, `drone`, `sample`.
+Layer types: `rainscene`, `firescene`, `page_turns`, `pencil`, `noise`, `rain` (older, simpler rain), `thunder`, `ocean`, `fan`, `wind`, `crickets`, `binaural`, `drone`, `sample`.
 `send` (0 to 1) feeds the shared reverb and `dry` (0 to 1) lowers the direct sound to push a layer
 further away. `gate` makes any layer come and go (`on_s` / `off_s` ranges) and stop for good at `until_s`.
 See `sleepgen/layers.py` for each one's parameters.

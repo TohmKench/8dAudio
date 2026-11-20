@@ -57,6 +57,8 @@ WOODS = {
     "softwood": dict(rate=(1.5, 2.6), cascade=1.2, alpha=2.1, bright=1.1, whistle=0.8, hiss=1.0),
     "mixed": dict(rate=(1.0, 1.8), cascade=0.9, alpha=2.3, bright=1.0, whistle=0.4, hiss=0.8),
     "hardwood": dict(rate=(0.55, 1.1), cascade=0.6, alpha=2.6, bright=0.9, whistle=0.15, hiss=0.6),
+    # A wooden candle wick: small, bright, even crackles in little runs, no sap singing.
+    "wick": dict(rate=(1.5, 2.4), cascade=1.4, alpha=2.8, bright=1.25, whistle=0.0, hiss=0.3),
 }
 
 
@@ -73,6 +75,8 @@ class FirePlace:
     transmission: tuple | None = None  # (cutoff Hz, order, gain): stove walls / glass
     room: dict | None = None
     ticks: bool = False    # a cast iron stove ticks as it expands
+    settles: bool = True   # logs shift now and then (a candle has none)
+    sputter: float = 1.0   # how long each crack's sputter of grains lasts (1 = a log fire's 10-30 ms)
 
 
 def _side(rng):
@@ -125,11 +129,26 @@ def env_bonfire(rng):
     )
 
 
+def env_candle(rng):
+    """A wood-wick candle on the desk in front of you: a tiny flame (it flickers at about
+    14 Hz, the same puffing law as a bonfire's slow breathing) and soft, bright crackles from
+    the wick. An ordinary wax candle is silent, so a candle you can hear is a wooden wick."""
+    return FirePlace(
+        title="Crackling Candle",
+        center=(_side(rng) * rng.uniform(0.1, 0.35), rng.uniform(0.5, 0.8), -0.25),
+        size=(0.006, 0.006, 0.01), diameter=rng.uniform(0.010, 0.014), roar_hz=rng.uniform(400, 600),
+        coherence=0.95, mix_db=dict(roar=0.0, fizz=-20.0, hiss=-14.0, crackle=-2.0),  # no embers to tick
+        room=dict(rt60=rng.uniform(0.3, 0.45), predelay_ms=4, damping=0.7, wet=0.12),  # a quiet study
+        settles=False, sputter=0.45,
+    )
+
+
 FIRE_ENVIRONMENTS = {
     "campfire": dict(build=env_campfire, title="Crackling Campfire", name="Campfire", outdoor=True),
     "fireplace": dict(build=env_fireplace, title="Crackling Fireplace", name="Fireplace", outdoor=False),
     "wood_stove": dict(build=env_wood_stove, title="Wood Stove Fire", name="Wood Stove", outdoor=False),
     "bonfire": dict(build=env_bonfire, title="Bonfire at Night", name="Bonfire", outdoor=True),
+    "candle": dict(build=env_candle, title="Crackling Candle", name="Candle", outdoor=False, wood="wick"),
 }
 
 
@@ -319,9 +338,9 @@ def _spectrum_fir(points, path=None, taps=2047):
 class FireScene(Layer):
     """A wood fire in a setting, heard from the listener's position.
 
-    environment  campfire, fireplace, wood_stove, bonfire
+    environment  campfire, fireplace, wood_stove, bonfire, candle
     intensity    how big and lively the fire is (0.4 low embers .. 1.4 roaring)
-    wood         softwood (pops, sap), mixed, hardwood (steady, deep)
+    wood         softwood (pops, sap), mixed, hardwood (steady, deep); a candle always burns a wick
     dampness     0 dry .. 1 damp (more steam hiss, sizzle and singing)
     variability  how far the fire wanders between brighter and lower spells
     budget       individually rendered ember ticks per second (default depends on device)
@@ -334,6 +353,7 @@ class FireScene(Layer):
                  variability=0.25, budget=None, crest_db=20.0):
         if environment not in FIRE_ENVIRONMENTS:
             raise ValueError(f"unknown fire setting {environment!r}; choose from {', '.join(FIRE_ENVIRONMENTS)}")
+        wood = FIRE_ENVIRONMENTS[environment].get("wood", wood)
         if wood not in WOODS:
             raise ValueError(f"unknown wood {wood!r}; choose from {', '.join(WOODS)}")
         self.torch = gpu._torch()
@@ -455,13 +475,14 @@ class FireScene(Layer):
         t, a = np.concatenate([times, t2]), np.concatenate([sizes, a2])
         fc = crack_colour(rng, a, self.bright)
         # Bigger cracks sputter on for longer.
-        n_g = rng.poisson(18.0 + 12.0 * np.minimum(a, 3.0))
+        sp = self.place.sputter
+        n_g = rng.poisson((18.0 + 12.0 * np.minimum(a, 3.0)) * sp)
         par = np.repeat(np.arange(len(t)), n_g)
         gap = rng.exponential(0.00045 * SR, len(par))
         cs = np.cumsum(gap)
         first = np.cumsum(n_g) - n_g
         off = cs - np.repeat(np.concatenate([[0.0], cs])[first], n_g)
-        tau = rng.uniform(0.004, 0.012, len(t)) * SR
+        tau = rng.uniform(0.004, 0.012, len(t)) * SR * sp
         ag = a[par] * rng.uniform(0.35, 0.8, len(par)) * np.exp(-off / tau[par])
         return (t, a * 0.9, fc), (t[par] + off, ag, fc[par])
 
@@ -482,7 +503,7 @@ class FireScene(Layer):
         dt = CTRL / SR
         # A log settle this second? It flares the fire up for a while afterwards.
         settle_at = None
-        if rng.random() < 1.0 / self.settle_gap:
+        if rng.random() < 1.0 / self.settle_gap and self.place.settles:
             settle_at = int(rng.integers(NC))
         inten = self.inten.blocks(NC)
         flare = np.empty(NC)

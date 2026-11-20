@@ -113,16 +113,19 @@ def base_fire(rng, ctx, modifier, strength):
 
     spec = FIRE_ENVIRONMENTS[modifier]
     wood = _pick(rng, FIRE_WOODS)
+    damp = _r(rng, 0.0, 0.5)
+    if "wood" in spec:  # a candle always burns its wick
+        wood, damp = spec["wood"], round(damp * 0.3, 2)
     ctx["detail"]["wood"] = wood
     ctx["features"].append("3D Audio")
     layer = {"type": "firescene", "level_db": 0.0, "send": _r(rng, 0.0, 0.06),
              "params": {"environment": modifier, "intensity": _r(rng, *FIRE_INTENSITY[strength]),
-                        "wood": wood, "dampness": _r(rng, 0.0, 0.5), "variability": _r(rng, 0.15, 0.3)}}
+                        "wood": wood, "dampness": damp, "variability": _r(rng, 0.15, 0.3)}}
     layers = [layer]
-    if library_files(ctx["library"], ["fire"]) and rng.random() < 0.4:
+    if library_files(ctx["library"], ["fire"]) and rng.random() < 0.4 and "wood" not in spec:
         layers.append(_sample(rng, ctx, ["fire"], _r(rng, -12, -6, 1)))
     word = FIRE_WORDS[strength]
-    return layers, f"{word} {spec['name']}" if word else spec["title"]
+    return layers, f"{word} {spec['name']}" if word and "wood" not in spec else spec["title"]
 
 
 def base_ocean(rng, ctx, modifier, strength):
@@ -224,6 +227,14 @@ def sec_stream(rng, ctx, level):
     return _sample(rng, ctx, ["stream"], level), "Stream"
 
 
+def sec_candle(rng, ctx, level):
+    """A wood-wick candle on the desk, softly crackling (the fire engine's candle setting)."""
+    # Its own level range: a few dB under the base, so the soft crackles come through.
+    return {"type": "firescene", "level_db": _r(rng, -9, -5, 1), "send": _r(rng, 0.05, 0.15),  # close by
+            "params": {"environment": "candle", "intensity": _r(rng, 0.7, 0.9), "wood": "wick",
+                       "dampness": _r(rng, 0.0, 0.15), "variability": _r(rng, 0.15, 0.25)}}, "Candlelight"
+
+
 # -------------------------------------------------------------------------- tertiaries
 # Each returns (layer, label). Night sounds get a `gate` so they come and go; in sleep videos
 # every tertiary also stops 45-60 minutes in (added by `_build`).
@@ -248,6 +259,21 @@ def ter_crickets(rng, ctx, level):
     return layer, "Crickets"
 
 
+def ter_page_turns(rng, ctx, level):
+    """Someone reading at the desk (desk.py). Close by: little reverb, all direct sound, and
+    louder than far-off night sounds (they are near you, and paper hides in the rain's hiss)."""
+    return {"type": "page_turns", "level_db": _r(rng, -6, -3, 1), "send": _r(rng, 0.12, 0.25), "dry": 1.0,
+            "params": {"paper": _pick(rng, {"book": 0.6, "notebook": 0.4}), "mean_gap": _r(rng, 30, 75, 0),
+                       "flurry": _r(rng, 0.05, 0.15)}, "gate": {}}, "Page Turning"
+
+
+def ter_pencil(rng, ctx, level):
+    """Someone writing in pencil at the desk, in spells (desk.py)."""
+    return {"type": "pencil", "level_db": _r(rng, -7, -4, 1), "send": _r(rng, 0.1, 0.2), "dry": 1.0,
+            "params": {"activity": _r(rng, 0.2, 0.4), "surface": _pick(rng, {"pad": 0.6, "desk": 0.4}),
+                       "pressure": _r(rng, 0.55, 0.9)}, "gate": {}}, "Pencil Writing"
+
+
 def _ter_library(category, label):
     def build(rng, ctx, level):
         layer = _sample(rng, ctx, [category], level)
@@ -267,23 +293,24 @@ BASES = {
                  modifiers={"roof": 1.0, "window": 1.0, "tin_roof": 0.8, "forest": 1.0, "lake": 0.8, "tent": 0.8},
                  indoor={"roof", "window", "tin_roof"}, outdoor_excludes={"fire"},
                  strengths={"gentle": 0.35, "steady": 0.4, "heavy": 0.25},
-                 secondaries=["wind", "noise_bed", "binaural", "drone", "fire"],
-                 tertiaries=["thunder", "crickets", "owl", "frogs", "chimes"]),
+                 secondaries=["wind", "noise_bed", "binaural", "drone", "fire", "candle"],
+                 tertiaries=["thunder", "crickets", "owl", "frogs", "chimes", "page_turns", "pencil"]),
     "fire": dict(build=base_fire, label="Fire",
-                 modifiers={"fireplace": 1.2, "campfire": 1.0, "wood_stove": 0.8, "bonfire": 0.6},
-                 indoor={"fireplace", "wood_stove"},
+                 modifiers={"fireplace": 1.2, "campfire": 1.0, "wood_stove": 0.8, "bonfire": 0.6, "candle": 0.5},
+                 indoor={"fireplace", "wood_stove", "candle"},
                  outdoor_excludes={"light_rain"},  # nobody sits by a campfire in the rain
                  indoor_excludes={"crickets", "owl", "frogs"},  # not heard over a fire indoors
                  strengths={"gentle": 0.3, "steady": 0.5, "roaring": 0.2},
+                 strengths_for={"candle": ["gentle", "steady"]},
                  secondaries=["light_rain", "wind", "noise_bed", "binaural"],
-                 tertiaries=["crickets", "owl"]),
+                 tertiaries=["crickets", "owl", "page_turns", "pencil"]),
     "ocean": dict(build=base_ocean, label="Ocean", modifiers={"beach": 1.0}, indoor=set(),
                   strengths={"calm": 0.5, "rolling": 0.5},
                   secondaries=["wind", "noise_bed", "binaural", "drone"], tertiaries=["crickets", "chimes"]),
     "noise": dict(build=base_noise, label="Noise", modifiers={"brown": 1.0, "pink": 0.6}, indoor=None,
                   strengths={"deep": 0.4, "soft": 0.4, "bright": 0.2},
                   strengths_for={"brown": ["deep", "soft"], "pink": ["soft", "bright"]},
-                  secondaries=["binaural", "drone", "light_rain"], tertiaries=[]),
+                  secondaries=["binaural", "drone", "light_rain"], tertiaries=["page_turns", "pencil"]),
     "fan": dict(build=base_fan, label="Fan", modifiers={"box_fan": 1.0}, indoor=None,
                 strengths={"low": 0.5, "high": 0.5},
                 secondaries=["light_rain", "binaural"], tertiaries=[]),
@@ -304,6 +331,7 @@ SECONDARIES = {
     "light_rain": dict(build=sec_light_rain),
     "fire": dict(build=sec_fire, indoor_only=True),
     "stream": dict(build=sec_stream, needs=["stream"]),
+    "candle": dict(build=sec_candle, indoor_only=True),
 }
 
 # `types`: which videos a tertiary belongs in. Night sounds suit both; desk sounds only study.
@@ -313,6 +341,8 @@ TERTIARIES = {
     "owl": dict(build=_ter_library("owl", "Owl"), needs=["owl"], types={"sleep", "study"}),
     "frogs": dict(build=_ter_library("frogs", "Frogs"), needs=["frogs"], types={"sleep", "study"}),
     "chimes": dict(build=_ter_library("chimes", "Wind Chimes"), needs=["chimes"], types={"sleep", "study"}),
+    "page_turns": dict(build=ter_page_turns, types={"study"}, indoor_only=True),
+    "pencil": dict(build=ter_pencil, types={"study"}, indoor_only=True),
 }
 
 # Scenes: fixed recipes across the four tiers, with their own title. A part ending in "?" is
@@ -386,7 +416,7 @@ def available_scenes(library=None) -> list[str]:
 
 
 # Which secondary reads best in a title when there are two.
-_TITLE_ORDER = ["Distant Wind", "Crackling Fire", "Stream", "Soft Rain", "Brown Noise", "Pink Noise"]
+_TITLE_ORDER = ["Candlelight", "Distant Wind", "Crackling Fire", "Stream", "Soft Rain", "Brown Noise", "Pink Noise"]
 
 
 def _headline(base_title, sec_labels, ter_labels):

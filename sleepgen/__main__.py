@@ -95,6 +95,11 @@ def main(argv=None) -> int:
     bn.add_argument("--full", choices=["flac", "m4a"],
                     help="time the whole pipeline (loudness, master chain, encoding) to a temporary file")
 
+    ds = sub.add_parser("describe", help="print the YouTube title, description and tags for a recipe "
+                                         "(refuses a recipe whose image owner isn't credited)")
+    ds.add_argument("recipe", help="recipe JSON, or a render's .json sidecar")
+    ds.add_argument("--hours", type=float, default=10.0)
+
     mt = sub.add_parser("match", help="tune a base sound to match a reference recording")
     mt.add_argument("reference")
     mt.add_argument("--base", default="rain", choices=["rain", "ocean"])
@@ -147,6 +152,18 @@ def main(argv=None) -> int:
             print(f"{env:10s} {secs / spent:6.1f}x realtime   10 h would take {per_hour * 10 / 60:6.1f} min"
                   + ("" if args.full else f"   (setup {t_init:.1f}s)"), flush=True)
         print(f"slowest: 10 h in about {worst * 10 / 60:.0f} min")
+        return 0
+
+    if args.cmd == "describe":
+        from .describe import MissingCredit, video_metadata
+        with open(args.recipe) as f:
+            data = json.load(f)
+        try:
+            meta = video_metadata(data.get("recipe", data), args.hours)
+        except MissingCredit as e:
+            print(f"refused: {e}", file=sys.stderr)
+            return 2
+        print(json.dumps(meta, indent=2, ensure_ascii=False))
         return 0
 
     if args.cmd == "match":
