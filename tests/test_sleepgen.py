@@ -531,7 +531,7 @@ def test_desk_sounds_are_gentle_events_whatever_the_chunk_size(cls, kw):
     assert 0.5 < np.sqrt(loud.mean()) < 2.0  # about unit RMS while sounding
     # No 10 ms burst far over the rest of it: a page turn is a rustle, never a bang (v1's landing
     # was a slap 17 dB over the rest of the turn and was heard as "loud bangs").
-    assert 10 * np.log10(ms.max() / loud.mean()) < (8 if cls is desk.PageTurns else 12)
+    assert 10 * np.log10(ms.max() / loud.mean()) < 12
     assert 20 * np.log10(np.abs(a).max() / np.sqrt(loud.mean())) < 24  # and no sharp clicks
     # One source on the desk, heard by both ears a fraction of a millisecond apart.
     lags = range(-48, 49)
