@@ -529,12 +529,30 @@ def test_desk_sounds_are_gentle_events_whatever_the_chunk_size(cls, kw):
     assert 0.2 < np.mean(ms < 1e-10) < 0.97  # silent between events
     loud = ms[ms > ms.max() * 0.01]
     assert 0.5 < np.sqrt(loud.mean()) < 2.0  # about unit RMS while sounding
-    assert 10 * np.log10(ms.max() / loud.mean()) < 12  # no 10 ms burst far over the rest of it
+    # No 10 ms burst far over the rest of it: a page turn is a rustle, never a bang (v1's landing
+    # was a slap 17 dB over the rest of the turn and was heard as "loud bangs").
+    assert 10 * np.log10(ms.max() / loud.mean()) < (8 if cls is desk.PageTurns else 12)
     assert 20 * np.log10(np.abs(a).max() / np.sqrt(loud.mean())) < 24  # and no sharp clicks
     # One source on the desk, heard by both ears a fraction of a millisecond apart.
     lags = range(-48, 49)
     xc = [np.dot(a[48:-48, 0], np.roll(a[:, 1], k)[48:-48]) for k in lags]
     assert max(xc) / np.sqrt(np.dot(a[:, 0], a[:, 0]) * np.dot(a[:, 1], a[:, 1])) > 0.6
+
+
+def test_a_page_turn_swells_and_fades_without_a_sudden_peak():
+    """The loudest moment of a turn is in its rustle, and no 10 ms jumps far over the 50 ms
+    before it (a slap on landing did, in v1)."""
+    win = SR // 100
+    for paper in ("book", "notebook"):
+        layer = desk.PageTurns(np.random.default_rng(7), paper=paper)
+        for _ in range(20):
+            y = layer._turn()
+            ms = np.mean(y[: len(y) // win * win].reshape(-1, win) ** 2, axis=1) + 1e-20
+            level = 10 * np.log10(ms / ms.max())
+            before = np.array([level[max(0, i - 5):i].max() if i else -120 for i in range(len(level))])
+            within = (level > -20) & (before > -20)  # the turn's first soft onset out of silence is fine
+            within[:5] = False
+            assert np.all((level - before)[within] < 9)
 
 
 def test_paper_friction_is_brighter_and_louder_when_faster():

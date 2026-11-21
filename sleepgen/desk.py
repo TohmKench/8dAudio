@@ -9,10 +9,11 @@ Both are built from what happens physically, not from recordings:
             stroke sounds brighter and louder, just as a real pencil does. A hard graphite
             tip catches every grain of the paper; a soft fingertip smooths over them.
   Body      The paper pad and the desk under it add a little low, woody resonance.
-  Pages     A turn is a soft finger slide at the corner, a few small crinkles as the page
-            bends, a breath of air as it swings over, and a soft flap as it lands on the
-            other pages, which it then slides on for a moment. Now and then a hand smooths
-            the new page flat, or a few pages are flipped through.
+  Pages     A turn is a rustle: a soft finger slide at the corner, then a swell of tiny
+            crinkles and paper brushing paper as the page flexes over (rising and falling
+            with its speed) and a breath of air, and it settles onto the other pages on a
+            cushion of air with a soft "fff", never a slap. Now and then a hand smooths the
+            new page flat, or a few pages are flipped through.
   Writing   Handwriting is strokes of 50-250 ms, each with a smooth rise and fall in speed,
             run together into words. The pencil lifts between words (and for the odd dot or
             cross) and lands again with a faint tick. Writing comes in spells with pauses
@@ -168,14 +169,19 @@ class _Desk:
 # ------------------------------------------------------------------------------- pages
 
 PAPERS = {
-    # flap brightness, the stack's low knock, how many crinkles a page makes as it bends
-    "book": dict(flap_lp=(2000, 3500), thump_hz=(110, 210), crinkles=1.5, air=0.18),
-    "notebook": dict(flap_lp=(3500, 6000), thump_hz=(160, 320), crinkles=3.0, air=0.22),
+    # rustle: tiny crinkles per second at the height of the swing (stiffer paper crackles
+    # more); colour: where the rustle's energy sits (Hz); settle: how soft the landing is
+    "book": dict(rustle=350.0, colour=(1500, 6000), air=0.12, settle_lp=(2500, 3500)),
+    "notebook": dict(rustle=700.0, colour=(2000, 8000), air=0.15, settle_lp=(3500, 5000)),
 }
 
 
 class PageTurns(_Events):
     """Someone reading at the desk turns a page now and then.
+
+    A page turn is a rustle, not a knock: the page flexes all the way over, so the sound is a
+    soft swell of tiny crinkles and paper brushing paper that rises and falls with the page's
+    speed, and the page settles onto a cushion of air at the end rather than slapping down.
 
     paper      book (soft, heavy pages) or notebook (crisper)
     mean_gap   seconds between turns, on average (reading speed)
@@ -192,63 +198,79 @@ class PageTurns(_Events):
         self.flurry = float(flurry)
         self.azimuth = float(rng.uniform(-20, 20) if azimuth is None else azimuth)
         self.desk = _Desk(rng, 120.0, 900.0)
+        # The crinkles' colours: a few broad (low-Q) bands, each grain of rustle rings in one.
+        lo, hi = self.p["colour"]
+        self.kernels = []
+        for fc in np.geomspace(lo, hi, 4):
+            sos = signal.butter(1, [fc / 1.6, fc * 1.6], "bandpass", fs=SR, output="sos")
+            imp = np.zeros(int(0.004 * SR))
+            imp[0] = 1.0
+            k = signal.sosfilt(sos, imp)
+            self.kernels.append(k / np.sqrt(np.sum(k ** 2)))
 
     def _gap(self):
         # Reading is fairly regular: a gamma spread around the mean, never back to back.
         return int(SR * max(6.0, self.rng.gamma(3.0, self.mean_gap / 3.0)))
 
+    def _rustle(self, rng, speed):
+        """Tiny crinkles of the flexing page, as many as its speed (0..1 per sample) calls for."""
+        n = len(speed)
+        lam = self.p["rustle"] * speed / SR
+        hits = rng.random(n) < lam
+        idx = np.flatnonzero(hits)
+        amp = rng.lognormal(0, 0.5, len(idx)) * rng.choice([-1.0, 1.0], len(idx))
+        out = np.zeros(n + len(self.kernels[0]) - 1)
+        band = rng.integers(0, len(self.kernels), len(idx))
+        for b, k in enumerate(self.kernels):
+            imp = np.zeros(n)
+            sel = band == b
+            imp[idx[sel]] = amp[sel]
+            out += signal.fftconvolve(imp, k)[: len(out)]
+        return out[:n] / np.sqrt(self.p["rustle"])  # about the same level whatever the paper
+
     def _turn(self):
         rng, p, d = self.rng, self.p, self.desk
-        y = np.zeros(int(2.2 * SR))
+        y = np.zeros(int(2.5 * SR))
 
         def add(at, x):
             i = int(at * SR)
             x = x[: len(y) - i]
             y[i:i + len(x)] += x
 
-        # 1. A finger slides over the corner and lifts it.
-        n = int(rng.uniform(0.07, 0.16) * SR)
-        v = rng.uniform(0.06, 0.15) * _bell(n) * (1 + 0.15 * _smooth_noise(rng, n, 40))
-        add(0.0, 0.35 * d.friction(d.tex_finger, v, np.sqrt(_bell(n))))
+        # 1. A finger slides softly over the corner and lifts it.
+        n = int(rng.uniform(0.08, 0.16) * SR)
+        v = rng.uniform(0.04, 0.09) * _bell(n) * (1 + 0.15 * _smooth_noise(rng, n, 40))
+        add(0.0, 0.07 * d.friction(d.tex_finger, v, np.sqrt(_bell(n))))
         t = n / SR * 0.6
-        # 2. The page bends: a few small crinkles.
-        bend = rng.uniform(0.12, 0.3)
-        for _ in range(rng.poisson(p["crinkles"])):
-            k = 3
-            f = np.exp(rng.uniform(np.log(1800), np.log(7000), k))
-            q = rng.uniform(2.0, 4.0, k)
-            click = _modes(rng, int(0.01 * SR), f, q / (np.pi * f), rng.normal(0, 1, k) / np.sqrt(k), 3e-5)
-            add(t + rng.uniform(0, bend), click * rng.lognormal(np.log(0.15), 0.4))
-        # 3. It swings over: a breath of air, and paper brushing paper as it leaves the stack.
-        t += bend * 0.5
-        swing = rng.uniform(0.25, 0.45)
+        # 2. The page bends up and swings over: a swell of rustle (tiny crinkles plus the edge
+        # brushing the next page) and a breath of air, rising and falling with its speed.
+        swing = rng.uniform(0.35, 0.65)
         n = int(swing * SR)
-        sos = signal.butter(2, [250, 2000], "bandpass", fs=SR, output="sos")
-        add(t, p["air"] * signal.sosfilt(sos, rng.standard_normal(n)) * _bell(n) ** 2 * 2.5)
-        m = int(rng.uniform(0.04, 0.08) * SR)
-        add(t, 0.25 * d.friction(d.tex_paper, rng.uniform(0.08, 0.14) * _bell(m), _bell(m)))
-        # 4. It lands on the other pages: a soft flap with a low knock from the book,
-        t += swing * rng.uniform(0.85, 1.0)
-        n = int(0.25 * SR)
+        u = np.arange(n) / n
+        speed = np.sin(np.pi * u ** rng.uniform(0.7, 1.0)) ** 2 * (1 + 0.25 * _smooth_noise(rng, n, 12)).clip(0.3)
+        add(t, 0.5 * self._rustle(rng, speed))
+        m = int(n * rng.uniform(0.3, 0.5))
+        add(t, 0.12 * d.friction(d.tex_paper, rng.uniform(0.05, 0.1) * _bell(m), _bell(m)))
+        sos = signal.butter(2, [300, 2500], "bandpass", fs=SR, output="sos")
+        add(t, p["air"] * signal.sosfilt(sos, rng.standard_normal(n)) * speed ** 2 * 2.0)
+        # 3. It settles onto the other pages on a cushion of air: a soft "fff", not a slap.
+        t += swing * rng.uniform(0.6, 0.75)  # it lands while still moving
+        n = int(0.4 * SR)
         tt = np.arange(n) / SR
-        env = (1 - np.exp(-tt / rng.uniform(0.002, 0.004))) * np.exp(-tt / rng.uniform(0.025, 0.06))
-        sos = signal.butter(2, [200, rng.uniform(*p["flap_lp"])], "bandpass", fs=SR, output="sos")
-        flap = signal.sosfilt(sos, rng.standard_normal(n)) * env
-        f0 = rng.uniform(*p["thump_hz"])
-        knock = _modes(rng, n, [f0], [rng.uniform(0.012, 0.025)], [1.0], attack=0.003)
-        add(t, flap / (np.sqrt(np.mean(flap ** 2)) + 1e-12) * 0.25 + 0.06 * knock)
-        # 5. and slides on them for a moment as it settles.
-        m = int(rng.uniform(0.06, 0.15) * SR)
-        add(t + 0.01, 0.2 * d.friction(d.tex_paper, rng.uniform(0.02, 0.05) * _bell(m), np.sqrt(_bell(m))))
+        env = (1 - np.exp(-tt / rng.uniform(0.015, 0.03))) * np.exp(-tt / rng.uniform(0.05, 0.1))
+        sos = signal.butter(2, [500, rng.uniform(*p["settle_lp"])], "bandpass", fs=SR, output="sos")
+        fff = signal.sosfilt(sos, rng.standard_normal(n)) * env
+        add(t, 0.05 * fff / (np.sqrt(np.mean(fff[: int(0.15 * SR)] ** 2)) + 1e-12))
+        add(t, 0.25 * self._rustle(rng, np.exp(-tt / 0.04) * 0.5))  # a last few crinkles
         end = t + 0.3
-        # 6. Sometimes a hand smooths the new page flat.
+        # 4. Sometimes a hand smooths the new page flat.
         if rng.random() < 0.3:
-            t2 = t + rng.uniform(0.25, 0.6)
-            m = int(rng.uniform(0.25, 0.5) * SR)
-            v = rng.uniform(0.05, 0.1) * _bell(m) * (1 + 0.1 * _smooth_noise(rng, m, 15))
-            add(t2, 0.25 * d.friction(d.tex_finger, v, _bell(m) ** 0.5))
+            t2 = t + rng.uniform(0.3, 0.7)
+            m = int(rng.uniform(0.3, 0.6) * SR)
+            v = rng.uniform(0.04, 0.08) * _bell(m) * (1 + 0.1 * _smooth_noise(rng, m, 15))
+            add(t2, 0.12 * d.friction(d.tex_finger, v, _bell(m) ** 0.5))
             end = t2 + m / SR
-        return y[: int(min(end + 0.1, 2.2) * SR)]
+        return y[: int(min(end + 0.1, 2.5) * SR)]
 
     def _event(self):
         rng = self.rng

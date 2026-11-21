@@ -262,7 +262,7 @@ def ter_crickets(rng, ctx, level):
 def ter_page_turns(rng, ctx, level):
     """Someone reading at the desk (desk.py). Close by: little reverb, all direct sound, and
     louder than far-off night sounds (they are near you, and paper hides in the rain's hiss)."""
-    return {"type": "page_turns", "level_db": _r(rng, -6, -3, 1), "send": _r(rng, 0.12, 0.25), "dry": 1.0,
+    return {"type": "page_turns", "level_db": _r(rng, -8, -5, 1), "send": _r(rng, 0.12, 0.25), "dry": 1.0,
             "params": {"paper": _pick(rng, {"book": 0.6, "notebook": 0.4}), "mean_gap": _r(rng, 30, 75, 0),
                        "flurry": _r(rng, 0.05, 0.15)}, "gate": {}}, "Page Turning"
 
