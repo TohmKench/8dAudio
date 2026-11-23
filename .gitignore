@@ -9,3 +9,7 @@ sounds/
 *.wav
 *.flac
 *.opus
+# sleepgen tune: downloaded reference recordings, run folders, API keys
+references/
+runs/
+.env

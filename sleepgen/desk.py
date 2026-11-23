@@ -144,10 +144,9 @@ class _Desk:
 
     def __init__(self, rng, body_lo=180.0, body_hi=1500.0):
         self.tex_rng = child(rng)
-        n = 1 << 20  # about half a metre of paper
-        self.tex_graphite = _texture(child(rng), n, 1 / 100.0, 1 / 10.0, spikes=0.6)
-        self.tex_paper = _texture(child(rng), n, 1 / 300.0, 1 / 15.0, spikes=0.25, spike_um=8.0)
-        self.tex_finger = _texture(child(rng), n, 1 / 400.0, 1 / 25.0)
+        # Each texture is made the first time it is used (a page turn never needs graphite).
+        self._tex_rngs = {name: child(rng) for name in ("graphite", "paper", "finger")}
+        self._tex = {}
         # Paper and wood are heavily damped: every mode dies within a few cycles (Q 2-6). Lightly
         # damped modes ring like metal (v2 had Q up to 50 and sounded like "metal scraping").
         k = 8
@@ -155,6 +154,23 @@ class _Desk:
         q = rng.uniform(2.0, 6.0, k)
         body = _modes(rng, int(0.06 * SR), f, q / (np.pi * f), rng.normal(0, 1, k), attack=2e-4)
         self.body = body / np.sqrt(np.sum(body ** 2))
+
+    _TEXTURES = {  # cycles per micrometre (low, high), sharp tooth share, tooth width (um)
+        "graphite": (1 / 100.0, 1 / 10.0, 0.6, 5.0),
+        "paper": (1 / 300.0, 1 / 15.0, 0.25, 8.0),
+        "finger": (1 / 400.0, 1 / 25.0, 0.0, 5.0),
+    }
+
+    def _texture(self, name):
+        if name not in self._tex:
+            lo, hi, spikes, um = self._TEXTURES[name]
+            n = 1 << 20  # about half a metre of paper
+            self._tex[name] = _texture(self._tex_rngs[name], n, lo, hi, spikes=spikes, spike_um=um)
+        return self._tex[name]
+
+    tex_graphite = property(lambda self: self._texture("graphite"))
+    tex_paper = property(lambda self: self._texture("paper"))
+    tex_finger = property(lambda self: self._texture("finger"))
 
     def friction(self, tex, v, force):
         """Sliding at speed v (m/s, per sample) with contact `force` (0..1): the texture read
@@ -173,10 +189,33 @@ class _Desk:
 
 PAPERS = {
     # rustle: crackles per second at the height of the swing (stiffer paper crackles more);
-    # colour: how high the crackles reach (Hz); settle: how soft the landing is
-    "book": dict(rustle=450.0, colour=(1800, 5000), air=0.15, settle_lp=(2500, 3500)),
-    "notebook": dict(rustle=600.0, colour=(2500, 7000), air=0.12, settle_lp=(3500, 5000)),
+    # colour_lo/hi: how high the crackles reach (Hz); settle_lp: how soft the landing is
+    "book": dict(rustle=450.0, colour_lo=1800.0, colour_hi=5000.0, air=0.15, settle_lp=3000.0),
+    "notebook": dict(rustle=600.0, colour_lo=2500.0, colour_hi=7000.0, air=0.12, settle_lp=4250.0),
 }
+
+# Everything else about the sound of a turn. `PageTurns(shape=...)` overrides any of these (or
+# of the paper's), which is how `sleepgen tune` searches for settings that sound like real pages.
+PAGE_SHAPE = dict(
+    rustle_level=0.12,  # crackles while the page swings over
+    crackle_ms=0.9,     # how long one crackle lasts (each between 1/3 and 5/3 of this)
+    crackle_hp=600.0,   # crackles have nothing below this
+    sizes_alpha=2.5,    # crackle sizes are Pareto: smaller = more crisp ones standing out
+    speed_exp=0.75,     # a slow page crackles more softly (size goes with speed to this power)
+    swing=0.5,          # seconds the page takes to swing over (each turn 0.7-1.3x this)
+    air_lo=250.0,       # the "fwoosh" of air moved by the page: its band
+    air_hi=3000.0,
+    fff_level=0.03,     # the page settling onto a cushion of air
+    fff_attack=0.0225,
+    fff_decay=0.075,
+    land_rustle=0.08,   # a last few crackles as it settles
+    flap_level=0.0,     # a soft low "thup" as the page lands (paper onto paper)
+    flap_hz=500.0,
+    finger_level=0.02,  # a fingertip sliding over the corner, and the hand smoothing the page
+    smooth_chance=0.3,
+    body_mix=0.1,       # the book under it: a little low resonance
+    limit_db=18.0,      # no crackle more than this over the turn's level
+)
 
 
 class PageTurns(_Events):
@@ -190,29 +229,35 @@ class PageTurns(_Events):
     mean_gap   seconds between turns, on average (reading speed)
     flurry     chance that a turn becomes a quick flip through a few pages
     azimuth    where the book lies, degrees to the right of straight ahead
+    shape      overrides for PAGE_SHAPE / PAPERS settings (see `sleepgen tune`)
     """
 
-    def __init__(self, rng, paper="book", mean_gap=45.0, flurry=0.1, azimuth=None):
+    def __init__(self, rng, paper="book", mean_gap=45.0, flurry=0.1, azimuth=None, shape=None):
         if paper not in PAPERS:
             raise ValueError(f"unknown paper {paper!r}; choose from {', '.join(PAPERS)}")
+        unknown = set(shape or {}) - set(PAGE_SHAPE) - set(PAPERS[paper])
+        if unknown:
+            raise ValueError(f"unknown page-turn settings: {', '.join(sorted(unknown))}")
         super().__init__(child(rng), first_s=rng.uniform(4, min(30.0, mean_gap)))
-        self.p = PAPERS[paper]
+        self.p = p = {**PAGE_SHAPE, **PAPERS[paper], **{k: float(v) for k, v in (shape or {}).items()}}
         self.mean_gap = float(mean_gap)
         self.flurry = float(flurry)
         self.azimuth = float(rng.uniform(-20, 20) if azimuth is None else azimuth)
         self.desk = _Desk(rng, 120.0, 900.0)
-        # Each crackle is a tiny dry burst, a fraction of a millisecond to a millisecond and a
-        # half of noise, rolled off gently (first order, non-ringing) above a corner that varies
-        # from crackle to crackle: paper crackles are dry, never tuned, and never a bare click.
-        lo, hi = self.p["colour"]
+        # Each crackle is a tiny dry burst, a fraction of a millisecond to a few milliseconds of
+        # noise, rolled off gently (first order, non-ringing) above a corner that varies from
+        # crackle to crackle: paper crackles are dry, never tuned, and never a bare click.
+        lo = max(p["colour_lo"], p["crackle_hp"] * 1.2)
+        hi = min(max(p["colour_hi"], lo * 1.3), 0.45 * SR)
         self.size_ms = float(np.mean(self._sizes(np.random.default_rng(0), 200000) ** 2))
         self.kernels = []
         krng = child(rng)
-        L = int(0.006 * SR)
+        c = p["crackle_ms"] * 1e-3
+        L = int(max(0.006, 6 * c) * SR)
         tt = np.arange(L) / SR
         for fc in np.geomspace(lo, hi, 16):
-            sos = signal.butter(1, [600, fc], "bandpass", fs=SR, output="sos")
-            burst = krng.standard_normal(L) * (1 - np.exp(-tt / 1.5e-4)) * np.exp(-tt / krng.uniform(3e-4, 1.5e-3))
+            sos = signal.butter(1, [p["crackle_hp"], fc], "bandpass", fs=SR, output="sos")
+            burst = krng.standard_normal(L) * (1 - np.exp(-tt / 1.5e-4)) * np.exp(-tt / krng.uniform(c / 3, c * 5 / 3))
             k = signal.sosfilt(sos, burst)
             self.kernels.append(k / np.sqrt(np.sum(k ** 2)))
 
@@ -220,9 +265,9 @@ class PageTurns(_Events):
         # Reading is fairly regular: a gamma spread around the mean, never back to back.
         return int(SR * max(6.0, self.rng.gamma(3.0, self.mean_gap / 3.0)))
 
-    @staticmethod
-    def _sizes(rng, k):
-        return np.minimum((1 - rng.random(k)) ** (-1 / 2.5), 2.5)  # Pareto, capped: no freak cracks
+    def _sizes(self, rng, k):
+        # Pareto, capped: no freak cracks
+        return np.minimum((1 - rng.random(k)) ** (-1 / self.p["sizes_alpha"]), 2.5)
 
     def _rustle(self, rng, speed):
         """Crackles of the flexing page, as many as its speed (0..1 per sample) calls for. Like
@@ -231,14 +276,16 @@ class PageTurns(_Events):
         lam = self.p["rustle"] * np.sqrt(speed) / SR
         hits = rng.random(n) < lam
         idx = np.flatnonzero(hits)
-        # A slowly moving page crackles less often and more softly than a fast one (power goes
-        # with speed squared); mostly more softly, so a slow start isn't a few lone ticks.
-        amp = self._sizes(rng, len(idx)) * speed[idx] ** 0.75 * rng.choice([-1.0, 1.0], len(idx))
+        # A slowly moving page crackles less often and more softly than a fast one; mostly more
+        # softly, so a slow start isn't a few lone ticks.
+        amp = self._sizes(rng, len(idx)) * speed[idx] ** self.p["speed_exp"] * rng.choice([-1.0, 1.0], len(idx))
         out = np.zeros(n + len(self.kernels[0]) - 1)
         band = rng.integers(0, len(self.kernels), len(idx))
         for b, k in enumerate(self.kernels):
-            imp = np.zeros(n)
             sel = band == b
+            if not sel.any():
+                continue
+            imp = np.zeros(n)
             imp[idx[sel]] = amp[sel]
             out += signal.fftconvolve(imp, k)[: len(out)]
         # Unit RMS at full speed, whatever the paper.
@@ -250,41 +297,64 @@ class PageTurns(_Events):
 
         def add(at, x):
             i = int(at * SR)
-            x = x[: len(y) - i]
+            x = x[: max(0, len(y) - i)]
             y[i:i + len(x)] += x
 
         # 1. A finger slides softly over the corner and lifts it.
         n = int(rng.uniform(0.08, 0.16) * SR)
         v = rng.uniform(0.04, 0.09) * _bell(n) * (1 + 0.15 * _smooth_noise(rng, n, 40))
-        add(0.0, 0.02 * d.friction(d.tex_finger, v, np.sqrt(_bell(n))))
+        add(0.0, p["finger_level"] * d.friction(d.tex_finger, v, np.sqrt(_bell(n))))
         t = n / SR * 0.6
         # 2. The page bends up and swings over: a swell of crackles and a "fwoosh" of air,
         # rising and falling with its speed.
-        swing = rng.uniform(0.35, 0.65)
+        swing = min(p["swing"] * rng.uniform(0.7, 1.3), 1.6)
         n = int(swing * SR)
         u = np.arange(n) / n
         speed = np.sin(np.pi * u ** rng.uniform(0.7, 1.0)) ** 2 * (1 + 0.25 * _smooth_noise(rng, n, 12)).clip(0.3)
-        add(t, 0.12 * self._rustle(rng, speed))
-        sos = signal.butter(1, [250, 3000], "bandpass", fs=SR, output="sos")
+        add(t, p["rustle_level"] * self._rustle(rng, speed))
+        air_lo = min(p["air_lo"], 0.4 * SR)
+        sos = signal.butter(1, [air_lo, min(max(p["air_hi"], air_lo * 1.5), 0.45 * SR)], "bandpass", fs=SR,
+                            output="sos")
         add(t, p["air"] * signal.sosfilt(sos, rng.standard_normal(n)) * speed)
         # 3. It settles onto the other pages on a cushion of air: a soft "fff", not a slap.
         t += swing * rng.uniform(0.6, 0.75)  # it lands while still moving
         n = int(0.4 * SR)
         tt = np.arange(n) / SR
-        env = (1 - np.exp(-tt / rng.uniform(0.015, 0.03))) * np.exp(-tt / rng.uniform(0.05, 0.1))
-        sos = signal.butter(2, [500, rng.uniform(*p["settle_lp"])], "bandpass", fs=SR, output="sos")
+        env = (1 - np.exp(-tt / (p["fff_attack"] * rng.uniform(0.67, 1.33)))) \
+            * np.exp(-tt / (p["fff_decay"] * rng.uniform(0.67, 1.33)))
+        lp = min(max(p["settle_lp"] * rng.uniform(0.85, 1.15), 700.0), 0.45 * SR)
+        sos = signal.butter(2, [500, lp], "bandpass", fs=SR, output="sos")
         fff = signal.sosfilt(sos, rng.standard_normal(n)) * env
-        add(t, 0.03 * fff / (np.sqrt(np.mean(fff[: int(0.15 * SR)] ** 2)) + 1e-12))
-        add(t, 0.08 * self._rustle(rng, np.exp(-tt / 0.04) * 0.5))  # a last few crackles
+        add(t, p["fff_level"] * fff / (np.sqrt(np.mean(fff[: int(0.15 * SR)] ** 2)) + 1e-12))
+        add(t, p["land_rustle"] * self._rustle(rng, np.exp(-tt / 0.04) * 0.5))  # a last few crackles
+        if p["flap_level"] > 0:  # the page meeting the others: a soft, low, damped "thup"
+            m = int(0.12 * SR)
+            tm = np.arange(m) / SR
+            sos = signal.butter(2, [80, min(p["flap_hz"], 0.4 * SR)], "bandpass", fs=SR, output="sos")
+            thup = signal.sosfilt(sos, rng.standard_normal(m)) * (1 - np.exp(-tm / 0.004)) * np.exp(-tm / 0.025)
+            add(t, p["flap_level"] * thup / (np.sqrt(np.mean(thup[: int(0.05 * SR)] ** 2)) + 1e-12))
         end = t + 0.3
         # 4. Sometimes a hand smooths the new page flat.
-        if rng.random() < 0.3:
+        if rng.random() < p["smooth_chance"]:
             t2 = t + rng.uniform(0.3, 0.7)
             m = int(rng.uniform(0.3, 0.6) * SR)
             v = rng.uniform(0.04, 0.08) * _bell(m) * (1 + 0.1 * _smooth_noise(rng, m, 15))
-            add(t2, 0.03 * d.friction(d.tex_finger, v, _bell(m) ** 0.5))
+            add(t2, p["finger_level"] * 1.5 * d.friction(d.tex_finger, v, _bell(m) ** 0.5))
             end = t2 + m / SR
         return y[: int(min(end + 0.1, 2.5) * SR)]
+
+    def turn(self) -> np.ndarray:
+        """One page turn on its own, mono, dry (no placement), unit RMS while it sounds. Used by
+        `sleepgen tune` to compare against recordings of real page turns."""
+        y = self.desk.with_body(self._turn(), self.p["body_mix"])
+        y = _unit(y[:, None])[:, 0]
+        return self._limit(y[:, None])[:, 0]
+
+    def _limit(self, y):
+        # The odd big crackle is eased down (smoothly, over a millisecond or two) so it never
+        # pokes out as a tick.
+        lim = PeakLimiter(10 ** (self.p["limit_db"] / 20), window_ms=1.0, channels=y.shape[1])
+        return lim(np.concatenate([y, np.zeros((2 * lim.W, y.shape[1]))]))[2 * lim.W:]
 
     def _event(self):
         rng = self.rng
@@ -295,12 +365,9 @@ class PageTurns(_Events):
         y = np.zeros(starts[-1] + len(turns[-1]))
         for s, x in zip(starts, turns):
             y[s:s + len(x)] += x
-        y = self.desk.with_body(y, 0.1)  # a book adds little; paper on paper is mostly airborne
+        y = self.desk.with_body(y, self.p["body_mix"])  # paper on paper is mostly airborne
         y = _unit(_place(y, self.azimuth + rng.uniform(-3, 3)))
-        # The odd big crackle is eased down (smoothly, over a millisecond or two) so it never
-        # pokes out as a tick: nothing more than 18 dB over the turn's level.
-        lim = PeakLimiter(10 ** (18 / 20), window_ms=1.0)
-        return lim(np.concatenate([y, np.zeros((2 * lim.W, 2))]))[2 * lim.W:]
+        return self._limit(y)
 
 
 # ------------------------------------------------------------------------------ pencil

@@ -13,6 +13,10 @@
   python -m sleepgen previews --fire -d previews               (fire in every setting)
   python -m sleepgen bench                                     (GPU speed check, synthesis only)
   python -m sleepgen bench --full flac --seconds 300           (whole pipeline incl. encoding)
+  python -m sleepgen refs fetch page_turns --query "page turn"  (CC0 reference recordings, Freesound)
+  python -m sleepgen tune page_turns references/page_turns     (search until it sounds like the real ones)
+  python -m sleepgen listen runs/page_turns                    (A/B page: pick, never describe)
+  python -m sleepgen tune page_turns references/page_turns --resume   (learn from the picks, go again)
 """
 
 from __future__ import annotations
@@ -31,6 +35,55 @@ def _length(args) -> float:
     if args.seconds:
         return float(args.seconds)
     return float(args.hours) * 3600
+
+
+def _tune(args) -> int:
+    """`tune`: score against the references, search, and write the listening set. With --resume,
+    first learn from the listening page's picks (new weights, start from the preferred version)."""
+    import shutil
+
+    from . import eventmatch as em
+    from .listen import load_picks
+    out = args.out or os.path.join("runs", args.target)
+    print(f"measuring the references in {args.references} ...", flush=True)
+    ref = em.Reference.from_folder(args.references)
+    print(f"  {len(ref.events)} events; room tone {ref.snr_db:.0f} dB under them", flush=True)
+    weights, start, round_no = None, None, 1
+    if args.resume:
+        best_path = os.path.join(out, "best.json")
+        trials_path = os.path.join(out, "listen", "trials.json")
+        picks = load_picks(out)
+        if not (os.path.isfile(best_path) and os.path.isfile(trials_path) and picks):
+            print("nothing to resume from: run `tune` and then `listen` first", file=sys.stderr)
+            return 2
+        with open(best_path) as fh:
+            best = json.load(fh)
+        with open(trials_path) as fh:
+            trials = json.load(fh)
+        v = em.verdict(picks)
+        weights = em.reweight(best.get("weights", {}), picks, trials["devs"])
+        prefer = max((k for k in trials["params"] if k != "real"), key=lambda k: v["rates"].get(k, 0.0))
+        start = trials["params"][prefer]
+        round_no = int(trials.get("round", 1)) + 1
+        archive = os.path.join(out, f"listen-{round_no - 1}")
+        shutil.rmtree(archive, ignore_errors=True)
+        shutil.copytree(os.path.join(out, "listen"), archive)
+        os.remove(os.path.join(out, "listen", "picks.json"))
+        print(f"from your picks: real preferred {', '.join(f'{k} {r:.0%}' for k, r in v['real_beats'].items())}; "
+              f"starting from {prefer}; weights " + " ".join(f"{g} {w:.2f}" for g, w in weights.items()))
+        if v["done"]:
+            print("(the real one no longer stood out: this round is a polish)")
+    listener = None if args.no_listener else em.try_listener(args.target)
+    if listener is not None:
+        ref.listener_good = listener.judge(ref.events)["good"]
+        print(f"  automatic listener hears the target in the real ones {ref.listener_good:.0%} of the time")
+    top = em.tune(args.target, ref, out, rounds=args.rounds, population=args.population, n_events=args.events,
+                  start=start, weights=weights, listener=listener)
+    em.make_listening(out, args.target, top, ref, round_no=round_no)
+    print(f"\nbest: score {top[0][1]['total']:.3f}, tell-apart {top[0][1]['tell_apart']:.2f} "
+          f"(0.5 = a classifier can't tell). Settings in {os.path.join(out, 'best.json')}")
+    print(f"now listen: python -m sleepgen listen {out}")
+    return 0
 
 
 def main(argv=None) -> int:
@@ -106,6 +159,30 @@ def main(argv=None) -> int:
     mt.add_argument("-o", "--out", default="matched")
     mt.add_argument("--evals", type=int, default=70)
 
+    rf = sub.add_parser("refs", help="reference recordings for `tune`: fetch CC0 ones, or check a folder")
+    rf.add_argument("action", choices=["fetch", "check"])
+    rf.add_argument("target", help="fetch: what they are for (e.g. page_turns); check: the folder")
+    rf.add_argument("--query", help='Freesound search, e.g. "page turn"')
+    rf.add_argument("-n", type=int, default=10, help="how many recordings to fetch")
+    rf.add_argument("-d", "--dir", help="where to put them (default references/<target>)")
+    rf.add_argument("--key", help="Freesound API key (default: FREESOUND_API_KEY or .env)")
+
+    tu = sub.add_parser("tune", help="tune a generated sound until it can't be told from real recordings")
+    tu.add_argument("target", choices=["page_turns"])
+    tu.add_argument("references", help="folder of real recordings of the sound")
+    tu.add_argument("-o", "--out", help="run folder (default runs/<target>)")
+    tu.add_argument("--rounds", type=int, default=30)
+    tu.add_argument("--population", type=int, default=24)
+    tu.add_argument("--events", type=int, default=10, help="generated events per variation")
+    tu.add_argument("--no-listener", action="store_true", help="don't use the audio recognition model")
+    tu.add_argument("--resume", action="store_true",
+                    help="learn from the picks on the listening page and run another round from there")
+
+    ls = sub.add_parser("listen", help="the A/B listening page for a `tune` run (on this computer only)")
+    ls.add_argument("run", help="run folder from `tune`")
+    ls.add_argument("--port", type=int, default=8765)
+    ls.add_argument("--no-browser", action="store_true")
+
     args = p.parse_args(argv)
     if args.quality:
         os.environ["SLEEPGEN_QUALITY"] = str(args.quality)
@@ -170,6 +247,27 @@ def main(argv=None) -> int:
         from .match import run
         report = run(args.reference, args.base, args.out, args.evals)
         print(json.dumps({k: report[k] for k in ("similarity_settings_only", "similarity_with_eq")}, indent=2))
+        return 0
+
+    if args.cmd == "refs":
+        from . import refs
+        if args.action == "fetch":
+            if not args.query:
+                p.error("refs fetch needs --query")
+            out = args.dir or os.path.join("references", args.target)
+            got = refs.fetch(args.query, out, args.n, args.key)
+            print(f"{len(got)} CC0 recordings in {out} (credits in sources.json)")
+        else:
+            refs.check(args.target)
+        return 0
+
+    if args.cmd == "tune":
+        return _tune(args)
+
+    if args.cmd == "listen":
+        from .listen import serve
+        picks = serve(args.run, args.port, not args.no_browser)
+        print(f"{len(picks)} picks saved in {os.path.join(args.run, 'listen', 'picks.json')}")
         return 0
 
     def make(a):

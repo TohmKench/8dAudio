@@ -622,3 +622,172 @@ def test_description_always_credits_the_image_owner(tmp_path):
     assert m["title"] == "Studying by a Rainy Window · 8 Hours" and len(m["title"]) <= 100
     assert "pencil writing" in m["tags"]
 
+
+
+# ------------------------------------------------------------------ tuning against recordings
+
+def _burst(rng, dur=0.3, ring=None, click=None):
+    """A soft noise burst (a stand-in event), optionally with a ringing tone or a sharp click."""
+    from scipy import signal as sg
+    n = int(dur * SR)
+    t = np.arange(n) / SR
+    env = np.sin(np.pi * t / dur) ** 2
+    x = sg.sosfilt(sg.butter(2, [500, 6000], "bandpass", fs=SR, output="sos"), rng.standard_normal(n)) * env
+    x /= np.sqrt(np.mean(x ** 2))
+    if ring:
+        x += 1.5 * np.sin(2 * np.pi * ring * t) * env
+    if click:
+        i = n // 3
+        x[i:i + 96] += 30 * np.exp(-np.arange(96) / 20) * rng.choice([-1, 1], 96)
+    return x
+
+
+def test_cutting_finds_each_event_and_the_room_tone_between():
+    from sleepgen import eventmatch as em
+    rng = np.random.default_rng(3)
+    parts = []
+    for _ in range(4):
+        parts += [np.zeros(int(1.5 * SR)), 0.1 * _burst(rng, rng.uniform(0.2, 0.6))]
+    x = np.concatenate(parts + [np.zeros(SR)])
+    x += 1e-4 * rng.standard_normal(len(x))
+    events = em.segment(x)
+    assert len(events) == 4
+    assert all(0.15 * SR < len(e) < 0.8 * SR for e in events)
+    room = em.room_noise(x)
+    assert len(room) > 2 * SR and np.sqrt(np.mean(room ** 2)) < 3e-4
+
+
+def test_measures_catch_ringing_bangs_and_dense_crackle():
+    """Each failure Thomas heard moves its own measure: a ringing tone ("metal") the ring
+    measures, a sharp click ("bang") crest and jump, a denser crackle ("ripping") the texture."""
+    from sleepgen import eventmatch as em
+    rng = np.random.default_rng(1)
+    soft = em.features(_burst(rng))
+    metal = em.features(_burst(rng, ring=3100))
+    bang = em.features(_burst(rng, click=True))
+    assert metal["ring_max"] > soft["ring_max"] + 6
+    assert bang["jump"] > soft["jump"] + 6 and bang["crest"] > soft["crest"] + 6
+
+    def crackle(rate):
+        n = SR // 2
+        imp = (rng.random(n) < rate / SR) * rng.choice([-1.0, 1.0], n)
+        return np.convolve(imp, np.exp(-np.arange(48) / 10) * rng.standard_normal(48))[:n] \
+            * np.sin(np.pi * np.arange(n) / n) ** 2
+    assert em.features(crackle(2000))["micro_rate"] != pytest.approx(em.features(crackle(60))["micro_rate"], abs=0.5)
+
+
+def test_score_prefers_the_settings_the_references_came_from():
+    from sleepgen import eventmatch as em
+    truth = dict(em.defaults("page_turns"), rustle=60, air=0.45, crackle_ms=2.0, swing=0.3, flap_level=0.12,
+                 rustle_level=0.05)
+    ref = em.Reference(em.render("page_turns", truth, 10, 99))
+    same = em.evaluate("page_turns", truth, ref)
+    other = em.evaluate("page_turns", em.defaults("page_turns"), ref)
+    assert same["distance"] < 0.6 * other["distance"]
+    assert same["tell_apart"] < other["tell_apart"]
+
+
+def test_the_search_finds_a_minimum_in_the_unit_cube():
+    from sleepgen.eventmatch import SepCMA
+    target = np.linspace(0.2, 0.8, 8)
+    es = SepCMA(np.full(8, 0.5), sigma=0.25, popsize=16, seed=2)
+    for _ in range(60):
+        X = es.ask()
+        es.tell(np.sum((np.clip(X, 0, 1) - target) ** 2, axis=1) + np.sum((X - np.clip(X, 0, 1)) ** 2, axis=1))
+    assert np.max(np.abs(es.m - target)) < 0.03
+
+
+def test_picks_shift_the_weights_and_decide_when_it_is_done():
+    from sleepgen import eventmatch as em
+    zero = {g: 0.0 for g in em.GROUPS}
+    devs = {"c1": dict(zero, texture=2.0, tone=0.5), "c2": dict(zero, ring=1.5), "real": zero}
+    picks = [{"a": "real", "b": "c1", "choice": "a"}, {"a": "c1", "b": "real", "choice": "b"},
+             {"a": "c2", "b": "real", "choice": "same"}]
+    w = em.reweight({}, picks, devs)
+    assert w["texture"] > w["tone"] > w["shape"] and w["ring"] == pytest.approx(w["shape"])
+    v = em.verdict(picks)
+    assert v["real_beats"]["c1"] == 1.0 and v["real_beats"]["c2"] == 0.5 and v["best"] == "c2" and v["done"]
+    assert not em.verdict(picks[:2])["done"]
+
+
+def test_listening_page_saves_picks_and_keeps_the_answers_hidden(tmp_path):
+    import threading
+    import urllib.error
+    import urllib.request
+    from sleepgen.listen import load_picks, make_server
+    d = tmp_path / "listen" / "clips"
+    d.mkdir(parents=True)
+    (d / "0a1b2c.wav").write_bytes(b"RIFF....")
+    trials = [{"id": 1, "a": "real", "b": "c1", "a_file": "9f8e7d.wav", "b_file": "0a1b2c.wav"},
+              {"id": 2, "a": "c1", "b": "c2", "a_file": "123456.wav", "b_file": "abcdef.wav"}]
+    (tmp_path / "listen" / "trials.json").write_text(json.dumps({"question": "Which?", "trials": trials}))
+    srv = make_server(str(tmp_path), 0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        public = json.loads(op.open(base + "/trials.json").read())
+        assert not {"real", "c1", "c2"} & set(json.dumps(public).replace('"', " ").split())
+        assert public["trials"][0]["a_file"] == "9f8e7d.wav"
+
+        def post(obj):
+            req = urllib.request.Request(base + "/pick", data=json.dumps(obj).encode())
+            return op.open(req).read()
+        post({"trial": 1, "choice": "b"})
+        post({"trial": 1, "choice": "a"})  # changed their mind: replaces the first pick
+        with pytest.raises(urllib.error.HTTPError):
+            post({"trial": 2, "choice": "maybe"})
+        with pytest.raises(urllib.error.HTTPError):
+            op.open(base + "/clips/..%2Ftrials.json")
+        assert op.open(base + "/clips/0a1b2c.wav").read() == b"RIFF...."
+    finally:
+        srv.shutdown()
+    picks = load_picks(str(tmp_path))
+    assert [(p["a"], p["b"], p["choice"]) for p in picks] == [("real", "c1", "a")]
+
+
+def test_reference_fetch_keeps_only_cc0_and_records_who_made_it(tmp_path):
+    import io
+    from sleepgen import refs
+    results = {"results": [
+        {"id": 1, "name": "page turn", "username": "alice", "license": "http://creativecommons.org/publicdomain/zero/1.0/",
+         "url": "https://freesound.org/s/1/", "duration": 1.2, "previews": {"preview-hq-mp3": "https://cdn/p1.mp3"}},
+        {"id": 2, "name": "book", "username": "bob", "license": "http://creativecommons.org/licenses/by/4.0/",
+         "url": "https://freesound.org/s/2/", "duration": 2.0, "previews": {"preview-hq-mp3": "https://cdn/p2.mp3"}},
+    ]}
+    asked = []
+
+    def opener(req, timeout=60):
+        asked.append(req.full_url)
+        body = json.dumps(results).encode() if "apiv2" in req.full_url else b"MP3DATA"
+        return io.BytesIO(body)
+    got = refs.fetch("page turn", str(tmp_path), n=5, key="SECRETKEY", opener=opener, log=lambda *_: None)
+    assert [s["id"] for s in got] == [1] and got[0]["author"] == "alice"
+    assert (tmp_path / "freesound_1.mp3").read_bytes() == b"MP3DATA" and not (tmp_path / "freesound_2.mp3").exists()
+    assert "SECRETKEY" not in (tmp_path / "sources.json").read_text()
+    assert 'Creative+Commons+0' in asked[0] or "Creative%20Commons%200" in asked[0]
+
+
+def test_page_turn_settings_can_be_overridden_for_tuning():
+    from sleepgen import desk
+    with pytest.raises(ValueError):
+        desk.PageTurns(np.random.default_rng(1), shape={"wobble": 1.0})
+    a = desk.PageTurns(np.random.default_rng(1), flurry=0, azimuth=0).turn()
+    b = desk.PageTurns(np.random.default_rng(1), flurry=0, azimuth=0, shape={"flap_level": 0.2}).turn()
+    assert a.ndim == 1 and np.isfinite(a).all() and not np.allclose(a[: len(b)], b[: len(a)])
+
+
+def test_the_automatic_listener_can_veto_a_candidate(tmp_path):
+    """When the recognition model hears a known failure, the candidate's score pays for it."""
+    from sleepgen import eventmatch as em
+
+    class Hears:
+        def judge(self, events, ref_good=None):
+            return {"good": 0.1, "heard": {"fabric ripping": len(events)}, "fails": 1.0, "penalty": 0.7}
+    truth = dict(em.defaults("page_turns"), air=0.45, rustle_level=0.05)
+    ref = em.Reference(em.render("page_turns", truth, 6, 99))
+    top = em.tune("page_turns", ref, str(tmp_path), rounds=1, population=4, n_events=4, listener=Hears(),
+                  log=lambda *_: None)
+    s = top[0][1]
+    assert s["total"] == pytest.approx(s["distance"] + 2.4) and s["listener"]["heard"] == {"fabric ripping": 4}
+    assert json.loads((tmp_path / "best.json").read_text())["top"][0]["score"]["listener"]["fails"] == 1.0

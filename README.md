@@ -188,10 +188,11 @@ paper is the paper's surface profile (fibres and tooth, micrometres apart) read 
 speed, so a faster stroke is brighter and louder, as with a real pencil; a hard graphite tip catches
 every grain, a fingertip smooths over them. The paper pad and desk add a little woody resonance.
 
-- **A page turn** is a finger sliding at the corner, a few small crinkles as the page bends, a breath of
-  air as it swings over, a soft flap and low knock as it lands, and a moment of sliding as it settles.
+- **A page turn** is a finger sliding at the corner, a swell of dry crackles and a "fwoosh" of air as the
+  page swings over, rising and falling with its speed, and a soft "fff" as it settles on a cushion of air.
   Sometimes a hand smooths the page, or a few pages are flipped through. `paper`: `book` or `notebook`;
-  `mean_gap` (s), `flurry`.
+  `mean_gap` (s), `flurry`; `shape` overrides any of the settings in `PAGE_SHAPE`, which is what
+  `sleepgen tune` searches (see below).
 - **Writing** is strokes of 50-250 ms with a smooth rise and fall in speed, run together into words. The
   pencil lifts between words and lands with a faint tick, and writing comes in spells with thinking
   pauses between. `activity` (share of time writing), `surface` (`pad` or `desk`), `pressure`.
@@ -270,6 +271,39 @@ See `sleepgen/layers.py` for each one's parameters.
 `python -m sleepgen match reference.mp3 --base rain` tunes a base sound's settings and a matching EQ
 until its tone, drop density, graininess and swell are as close as possible to the reference, and
 writes the recipe, both clips and a similarity report to `matched/`.
+
+## Tuning a short sound against real recordings (`tune`, `listen`)
+
+Describing a sound in words ("bangs", "metal scraping", "fabric ripping") is a poor way to tune it, so
+short sounds (page turns so far) are tuned in a loop where a person only ever picks:
+
+```bash
+python -m sleepgen refs fetch page_turns --query "page turn" -n 10   # CC0 recordings from Freesound
+python -m sleepgen refs check references/page_turns                  # what the loop measures against
+python -m sleepgen tune page_turns references/page_turns             # ~10 min on a desktop processor
+python -m sleepgen listen runs/page_turns                            # the A/B page
+python -m sleepgen tune page_turns references/page_turns --resume    # learn from the picks, go again
+```
+
+1. **References.** A few real recordings, cut into single events. `refs fetch` takes CC0 recordings only
+   and keeps each one's author and link in `sources.json`; it needs a free Freesound API key in
+   `FREESOUND_API_KEY` or a `.env` file (never in git). Your own recordings work too: drop them in the
+   folder. They are a measuring stick only, never part of a video.
+2. **Measures** (`sleepgen/eventmatch.py`), in six groups so each failure heard so far shows in one:
+   tone (third-octave balance), shape (length, attack, decay, outline: a bang starts too fast), texture
+   (how many tiny transients and how fast the level flickers: ripping is a dense, even buzz), ring
+   (narrow spectral peaks: metal), bang (crest factor, biggest sudden jump), colour (brightness and how
+   it moves). Each is scaled by how much the real recordings vary among themselves.
+3. **Score.** A symmetric nearest-neighbour distance: every generated event must be near a real one, and
+   every real one near a generated one. "Tell-apart" is how often a simple classifier separates them
+   (0.5 = it can't). With `pip install transformers`, an audio recognition model (CLAP) also says what it
+   hears; "a loud bang", "metal scraping" and "fabric ripping" are labels the winner must not get.
+4. **Loop.** A separable CMA-ES over the settings in `SPACES` (24 a round, 30 rounds), on the processor.
+5. **Listening page.** The best 3 and a real recording in every pairing, twice, at the same loudness and
+   over the recordings' own room tone, with opaque file names: "A is better", "B is better" or "Can't
+   tell". Picks are saved as you go (`runs/<target>/listen/picks.json`). `--resume` shifts the score's
+   weights toward whatever gave the generated ones away and starts from the preferred version. A sound
+   is done when the real recording wins no more than 60% of its pairs against the best version.
 
 ## Tests
 
